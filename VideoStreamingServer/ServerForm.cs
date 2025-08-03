@@ -330,10 +330,21 @@ namespace VideoStreamingServer
 						{
 							using (Graphics g = Graphics.FromImage(scaledBitmap))
 							{
+								// Create pen.
+								Pen blackPen = new Pen(Color.Black, 3);
+
+								// Create coordinates of points that define line.
+								float x1 = 100.0F;
+								float y1 = 100.0F;
+								float x2 = 500.0F;
+								float y2 = 100.0F;
+
+								// Draw line to screen.
 								g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.Bilinear;
 								g.CompositingQuality = System.Drawing.Drawing2D.CompositingQuality.HighSpeed;
 								g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.HighSpeed;
 								g.DrawImage(originalFrame, 0, 0, newWidth, newHeight);
+								g.DrawLine(blackPen, x1, y1, x2, y2);
 							}
 
 							// Convert to JPEG byte array
