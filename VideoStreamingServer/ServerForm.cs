@@ -9,6 +9,8 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 using System.Runtime.InteropServices;
 using System.Collections.Generic;
+using System.Text;
+using Newtonsoft.Json;
 
 // Alternative: Use AForge.NET instead of DirectShow
 // Install-Package AForge.Video
@@ -22,15 +24,21 @@ namespace VideoStreamingServer
 	public partial class ServerForm : Form
 	{
 		private TcpListener tcpListener;
+		private TcpListener commandListener;
 		private Thread serverThread;
+		private Thread commandThread;
 		private bool isStreaming = false;
 		private Button startButton;
 		private Button stopButton;
 		private Label statusLabel;
 		private Label clientCountLabel;
+		private Label commandStatusLabel;
 		private ComboBox cameraComboBox;
+		private RichTextBox commandLogTextBox;
 		private int connectedClients = 0;
-		private const int PORT = 8080;
+		private int connectedCommandClients = 0;
+		private const int VIDEO_PORT = 8080;
+		private const int COMMAND_PORT = 8081;
 
 		// AForge.NET objects (alternative to DirectShow)
 		private FilterInfoCollection videoDevices;
@@ -38,6 +46,11 @@ namespace VideoStreamingServer
 		private readonly object frameLock = new object();
 		private byte[] currentFrame;
 		private bool hasNewFrame = false;
+
+		// Command handling
+		private readonly object commandLock = new object();
+		private Queue<string> pendingCommands = new Queue<string>();
+		private bool streamPaused = false;
 
 		public ServerForm()
 		{
@@ -47,11 +60,11 @@ namespace VideoStreamingServer
 
 		private void InitializeComponent()
 		{
-			this.Size = new Size(450, 300);
-			this.Text = "Camera Video Streaming Server";
+			this.Size = new Size(600, 500);
+			this.Text = "Camera Video Streaming Server with Commands";
 			this.StartPosition = FormStartPosition.CenterScreen;
-			this.FormBorderStyle = FormBorderStyle.FixedDialog;
-			this.MaximizeBox = false;
+			this.FormBorderStyle = FormBorderStyle.Sizable;
+			this.MinimumSize = new Size(600, 500);
 
 			// Title label
 			Label titleLabel = new Label
@@ -59,7 +72,7 @@ namespace VideoStreamingServer
 				Text = "Camera Video Streaming Server",
 				Font = new Font("Arial", 14, FontStyle.Bold),
 				Location = new Point(50, 20),
-				Size = new Size(350, 25),
+				Size = new Size(500, 25),
 				TextAlign = ContentAlignment.MiddleCenter
 			};
 
@@ -104,32 +117,70 @@ namespace VideoStreamingServer
 			{
 				Text = "Server stopped",
 				Location = new Point(50, 160),
-				Size = new Size(300, 20),
+				Size = new Size(500, 20),
 				Font = new Font("Arial", 10, FontStyle.Regular)
 			};
 
 			clientCountLabel = new Label
 			{
-				Text = "Connected clients: 0",
-				Location = new Point(50, 190),
-				Size = new Size(300, 20),
+				Text = "Video clients: 0",
+				Location = new Point(50, 185),
+				Size = new Size(200, 20),
 				Font = new Font("Arial", 10, FontStyle.Regular)
 			};
 
-			// Port info label
-			Label portLabel = new Label
+			commandStatusLabel = new Label
 			{
-				Text = $"Listening on port: {PORT}",
-				Location = new Point(50, 220),
-				Size = new Size(300, 20),
+				Text = "Command clients: 0",
+				Location = new Point(280, 185),
+				Size = new Size(200, 20),
+				Font = new Font("Arial", 10, FontStyle.Regular)
+			};
+
+			// Port info labels
+			Label videoPortLabel = new Label
+			{
+				Text = $"Video port: {VIDEO_PORT}",
+				Location = new Point(50, 210),
+				Size = new Size(200, 20),
 				Font = new Font("Arial", 9, FontStyle.Italic),
 				ForeColor = Color.Gray
+			};
+
+			Label commandPortLabel = new Label
+			{
+				Text = $"Command port: {COMMAND_PORT}",
+				Location = new Point(280, 210),
+				Size = new Size(200, 20),
+				Font = new Font("Arial", 9, FontStyle.Italic),
+				ForeColor = Color.Gray
+			};
+
+			// Command log section
+			Label commandLogLabel = new Label
+			{
+				Text = "Command Log:",
+				Location = new Point(50, 245),
+				Size = new Size(100, 20),
+				Font = new Font("Arial", 10, FontStyle.Bold)
+			};
+
+			commandLogTextBox = new RichTextBox
+			{
+				Location = new Point(50, 270),
+				Size = new Size(500, 180),
+				Font = new Font("Consolas", 9, FontStyle.Regular),
+				BackColor = Color.Black,
+				ForeColor = Color.LimeGreen,
+				ReadOnly = true,
+				ScrollBars = RichTextBoxScrollBars.Vertical
 			};
 
 			this.Controls.AddRange(new Control[]
 			{
 				titleLabel, cameraLabel, cameraComboBox, startButton, stopButton,
-				statusLabel, clientCountLabel, portLabel
+				statusLabel, clientCountLabel, commandStatusLabel,
+				videoPortLabel, commandPortLabel, commandLogLabel, commandLogTextBox
 			});
 		}
 
@@ -190,18 +241,26 @@ namespace VideoStreamingServer
 				// Start camera capture
 				videoSource.Start();
 
-				// Start TCP server
-				tcpListener = new TcpListener(IPAddress.Any, PORT);
-				serverThread = new Thread(StartListening);
+				// Start TCP servers
+				tcpListener = new TcpListener(IPAddress.Any, VIDEO_PORT);
+				commandListener = new TcpListener(IPAddress.Any, COMMAND_PORT);
+
+				serverThread = new Thread(StartVideoListening);
 				serverThread.IsBackground = true;
 				serverThread.Start();
 
+				commandThread = new Thread(StartCommandListening);
+				commandThread.IsBackground = true;
+				commandThread.Start();
+
 				isStreaming = true;
 				startButton.Enabled = false;
-				stopButton.Enabled = true;
+				stopButton.Enabled = false;
 				cameraComboBox.Enabled = false;
-				statusLabel.Text = $"Server started on port {PORT} with camera";
+				statusLabel.Text = $"Server started - Video: {VIDEO_PORT}, Commands: {COMMAND_PORT}";
 				statusLabel.ForeColor = Color.Green;
+
+				LogCommand("SERVER", "Server started successfully");
 			}
 			catch (Exception ex)
 			{
@@ -218,12 +277,18 @@ namespace VideoStreamingServer
 			// Stop camera
 			CleanupCamera();
 
-			// Stop TCP server
+			// Stop TCP servers
 			tcpListener?.Stop();
+			commandListener?.Stop();
 
 			if (serverThread != null && serverThread.IsAlive)
 			{
 				serverThread.Join(2000);
+			}
+
+			if (commandThread != null && commandThread.IsAlive)
+			{
+				commandThread.Join(2000);
 			}
 
 			startButton.Enabled = true;
@@ -232,7 +297,10 @@ namespace VideoStreamingServer
 			statusLabel.Text = "Server stopped";
 			statusLabel.ForeColor = Color.Red;
 			connectedClients = 0;
-			UpdateClientCount();
+			connectedCommandClients = 0;
+			UpdateClientCounts();
+
+			LogCommand("SERVER", "Server stopped");
 		}
 
 		private bool InitializeCamera()
@@ -330,21 +398,13 @@ namespace VideoStreamingServer
 						{
 							using (Graphics g = Graphics.FromImage(scaledBitmap))
 							{
-								// Create pen.
-								Pen blackPen = new Pen(Color.Black, 3);
-
-								// Create coordinates of points that define line.
-								float x1 = 100.0F;
-								float y1 = 100.0F;
-								float x2 = 500.0F;
-								float y2 = 100.0F;
-
-								// Draw line to screen.
 								g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.Bilinear;
 								g.CompositingQuality = System.Drawing.Drawing2D.CompositingQuality.HighSpeed;
 								g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.HighSpeed;
 								g.DrawImage(originalFrame, 0, 0, newWidth, newHeight);
-								g.DrawLine(blackPen, x1, y1, x2, y2);
+
+								// Process any pending commands that affect the video
+								ProcessPendingCommands(g, newWidth, newHeight);
 							}
 
 							// Convert to JPEG byte array
@@ -366,7 +426,236 @@ namespace VideoStreamingServer
 			}
 		}
 
-		private void StartListening()
+		private void ProcessPendingCommands(Graphics g, int width, int height)
+		{
+			lock (commandLock)
+			{
+				while (pendingCommands.Count > 0)
+				{
+					string command = pendingCommands.Dequeue();
+					ExecuteDrawCommand(g, command, width, height);
+				}
+			}
+
+			// Draw pause indicator if stream is paused
+			if (streamPaused)
+			{
+				DrawPauseIndicator(g, width, height);
+			}
+		}
+
+		private void DrawPauseIndicator(Graphics g, int width, int height)
+		{
+			try
+			{
+				// Draw semi-transparent overlay
+				using (SolidBrush overlay = new SolidBrush(Color.FromArgb(128, Color.Black)))
+				{
+					g.FillRectangle(overlay, 0, 0, width, height);
+				}
+
+				// Draw pause symbol (two vertical bars)
+				int centerX = width / 2;
+				int centerY = height / 2;
+				int barWidth = 20;
+				int barHeight = 60;
+				int barSpacing = 15;
+
+				using (SolidBrush pauseBrush = new SolidBrush(Color.White))
+				{
+					// Left bar
+					g.FillRectangle(pauseBrush, centerX - barSpacing - barWidth, centerY - barHeight / 2, barWidth, barHeight);
+					// Right bar
+					g.FillRectangle(pauseBrush, centerX + barSpacing, centerY - barHeight / 2, barWidth, barHeight);
+				}
+
+				// Draw "PAUSED" text
+				using (Font pauseFont = new Font("Arial", 16, FontStyle.Bold))
+				using (SolidBrush textBrush = new SolidBrush(Color.White))
+				{
+					string pauseText = "PAUSED";
+					SizeF textSize = g.MeasureString(pauseText, pauseFont);
+					float textX = (width - textSize.Width) / 2;
+					float textY = centerY + barHeight / 2 + 20;
+					g.DrawString(pauseText, pauseFont, textBrush, textX, textY);
+				}
+			}
+			catch (Exception ex)
+			{
+				Console.WriteLine($"Error drawing pause indicator: {ex.Message}");
+			}
+		}
+
+		private void ExecuteDrawCommand(Graphics g, string command, int width, int height)
+		{
+			try
+			{
+				var commandObj = JsonConvert.DeserializeObject<Dictionary<string, object>>(command);
+				if (commandObj.ContainsKey("type"))
+				{
+					string type = commandObj["type"].ToString();
+
+					switch (type.ToLower())
+					{
+						case "line":
+							DrawLine(g, commandObj);
+							break;
+						case "rectangle":
+							DrawRectangle(g, commandObj);
+							break;
+						case "circle":
+							DrawCircle(g, commandObj);
+							break;
+						case "text":
+							DrawText(g, commandObj);
+							break;
+						case "togglepause":
+							HandleTogglePause(commandObj);
+							break;
+					}
+				}
+			}
+			catch (Exception ex)
+			{
+				LogCommand("ERROR", $"Failed to execute command: {ex.Message}");
+			}
+		}
+
+		private void HandleTogglePause(Dictionary<string, object> command)
+		{
+			streamPaused = !streamPaused;
+			string clientId = GetValueOrDefault(command, "clientId", "Unknown").ToString();
+			string timestamp = GetValueOrDefault(command, "timestamp", DateTime.Now.ToString()).ToString();
+
+			LogCommand("TOGGLEPAUSE", $"Stream {(streamPaused ? "PAUSED" : "RESUMED")} by {clientId} at {timestamp}");
+
+			this.Invoke(new Action(() =>
+			{
+				statusLabel.Text = $"Server running - Stream is {(streamPaused ? "PAUSED" : "PLAYING")} - Video: {VIDEO_PORT}, Commands: {COMMAND_PORT}";
+				statusLabel.ForeColor = streamPaused ? Color.Orange : Color.Green;
+			}));
+		}
+
+		private object GetValueOrDefault(Dictionary<string, object> dict, string key, object defaultValue)
+		{
+			return dict.ContainsKey(key) ? dict[key] : defaultValue;
+		}
+
+		private void DrawLine(Graphics g, Dictionary<string, object> command)
+		{
+			try
+			{
+				float x1 = Convert.ToSingle(GetValueOrDefault(command, "x1", 0));
+				float y1 = Convert.ToSingle(GetValueOrDefault(command, "y1", 0));
+				float x2 = Convert.ToSingle(GetValueOrDefault(command, "x2", 100));
+				float y2 = Convert.ToSingle(GetValueOrDefault(command, "y2", 100));
+				string colorStr = GetValueOrDefault(command, "color", "Red").ToString();
+				float thickness = Convert.ToSingle(GetValueOrDefault(command, "thickness", 2));
+
+				Color color = Color.FromName(colorStr);
+				using (Pen pen = new Pen(color, thickness))
+				{
+					g.DrawLine(pen, x1, y1, x2, y2);
+				}
+			}
+			catch (Exception ex)
+			{
+				LogCommand("ERROR", $"DrawLine error: {ex.Message}");
+			}
+		}
+
+		private void DrawRectangle(Graphics g, Dictionary<string, object> command)
+		{
+			try
+			{
+				float x = Convert.ToSingle(GetValueOrDefault(command, "x", 10));
+				float y = Convert.ToSingle(GetValueOrDefault(command, "y", 10));
+				float width = Convert.ToSingle(GetValueOrDefault(command, "width", 50));
+				float height = Convert.ToSingle(GetValueOrDefault(command, "height", 50));
+				string colorStr = GetValueOrDefault(command, "color", "Blue").ToString();
+				bool filled = Convert.ToBoolean(GetValueOrDefault(command, "filled", false));
+
+				Color color = Color.FromName(colorStr);
+
+				if (filled)
+				{
+					using (SolidBrush brush = new SolidBrush(color))
+					{
+						g.FillRectangle(brush, x, y, width, height);
+					}
+				}
+				else
+				{
+					using (Pen pen = new Pen(color, 2))
+					{
+						g.DrawRectangle(pen, x, y, width, height);
+					}
+				}
+			}
+			catch (Exception ex)
+			{
+				LogCommand("ERROR", $"DrawRectangle error: {ex.Message}");
+			}
+		}
+
+		private void DrawCircle(Graphics g, Dictionary<string, object> command)
+		{
+			try
+			{
+				float x = Convert.ToSingle(GetValueOrDefault(command, "x", 50));
+				float y = Convert.ToSingle(GetValueOrDefault(command, "y", 50));
+				float radius = Convert.ToSingle(GetValueOrDefault(command, "radius", 25));
+				string colorStr = GetValueOrDefault(command, "color", "Green").ToString();
+				bool filled = Convert.ToBoolean(GetValueOrDefault(command, "filled", false));
+
+				Color color = Color.FromName(colorStr);
+				float diameter = radius * 2;
+
+				if (filled)
+				{
+					using (SolidBrush brush = new SolidBrush(color))
+					{
+						g.FillEllipse(brush, x - radius, y - radius, diameter, diameter);
+					}
+				}
+				else
+				{
+					using (Pen pen = new Pen(color, 2))
+					{
+						g.DrawEllipse(pen, x - radius, y - radius, diameter, diameter);
+					}
+				}
+			}
+			catch (Exception ex)
+			{
+				LogCommand("ERROR", $"DrawCircle error: {ex.Message}");
+			}
+		}
+
+		private void DrawText(Graphics g, Dictionary<string, object> command)
+		{
+			try
+			{
+				float x = Convert.ToSingle(GetValueOrDefault(command, "x", 10));
+				float y = Convert.ToSingle(GetValueOrDefault(command, "y", 10));
+				string text = GetValueOrDefault(command, "text", "Sample Text").ToString();
+				string colorStr = GetValueOrDefault(command, "color", "Black").ToString();
+				float fontSize = Convert.ToSingle(GetValueOrDefault(command, "fontSize", 12));
+
+				Color color = Color.FromName(colorStr);
+				using (Font font = new Font("Arial", fontSize))
+				using (SolidBrush brush = new SolidBrush(color))
+				{
+					g.DrawString(text, font, brush, x, y);
+				}
+			}
+			catch (Exception ex)
+			{
+				LogCommand("ERROR", $"DrawText error: {ex.Message}");
+			}
+		}
+
+		private void StartVideoListening()
 		{
 			tcpListener.Start();
 
@@ -377,7 +666,7 @@ namespace VideoStreamingServer
 					TcpClient client = tcpListener.AcceptTcpClient();
 
 					// Handle each client in a separate thread
-					Thread clientThread = new Thread(() => HandleClient(client));
+					Thread clientThread = new Thread(() => HandleVideoClient(client));
 					clientThread.IsBackground = true;
 					clientThread.Start();
 				}
@@ -391,7 +680,7 @@ namespace VideoStreamingServer
 					if (isStreaming)
 					{
 						this.Invoke(new Action(() =>
-							MessageBox.Show($"Server error: {ex.Message}", "Error",
+							MessageBox.Show($"Video server error: {ex.Message}", "Error",
 								MessageBoxButtons.OK, MessageBoxIcon.Error)));
 					}
 					break;
@@ -399,26 +688,148 @@ namespace VideoStreamingServer
 			}
 		}
 
-		private void HandleClient(TcpClient client)
+		private void StartCommandListening()
+		{
+			commandListener.Start();
+
+			while (isStreaming)
+			{
+				try
+				{
+					TcpClient client = commandListener.AcceptTcpClient();
+
+					// Handle each command client in a separate thread
+					Thread clientThread = new Thread(() => HandleCommandClient(client));
+					clientThread.IsBackground = true;
+					clientThread.Start();
+				}
+				catch (ObjectDisposedException)
+				{
+					// Expected when stopping the server
+					break;
+				}
+				catch (Exception ex)
+				{
+					if (isStreaming)
+					{
+						this.Invoke(new Action(() =>
+							MessageBox.Show($"Command server error: {ex.Message}", "Error",
+								MessageBoxButtons.OK, MessageBoxIcon.Error)));
+					}
+					break;
+				}
+			}
+		}
+
+		private void HandleVideoClient(TcpClient client)
 		{
 			try
 			{
 				Interlocked.Increment(ref connectedClients);
-				this.Invoke(new Action(() => UpdateClientCount()));
+				this.Invoke(new Action(() => UpdateClientCounts()));
 
+				LogCommand("VIDEO", $"Video client connected from {client.Client.RemoteEndPoint}");
 				StreamToClient(client);
 			}
 			finally
 			{
 				Interlocked.Decrement(ref connectedClients);
-				this.Invoke(new Action(() => UpdateClientCount()));
+				this.Invoke(new Action(() => UpdateClientCounts()));
+				LogCommand("VIDEO", $"Video client disconnected");
 				client?.Close();
 			}
 		}
 
-		private void UpdateClientCount()
+		private void HandleCommandClient(TcpClient client)
 		{
-			clientCountLabel.Text = $"Connected clients: {connectedClients}";
+			try
+			{
+				Interlocked.Increment(ref connectedCommandClients);
+				this.Invoke(new Action(() => UpdateClientCounts()));
+
+				LogCommand("COMMAND", $"Command client connected from {client.Client.RemoteEndPoint}");
+				ReceiveCommands(client);
+			}
+			finally
+			{
+				Interlocked.Decrement(ref connectedCommandClients);
+				this.Invoke(new Action(() => UpdateClientCounts()));
+				LogCommand("COMMAND", $"Command client disconnected");
+				client?.Close();
+			}
+		}
+
+		private void ReceiveCommands(TcpClient client)
+		{
+			NetworkStream stream = client.GetStream();
+			byte[] buffer = new byte[4096];
+
+			while (isStreaming && client.Connected)
+			{
+				try
+				{
+					int bytesRead = stream.Read(buffer, 0, buffer.Length);
+					if (bytesRead > 0)
+					{
+						string commandData = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+
+						// Handle multiple commands if they come in one packet
+						string[] commands = commandData.Split('\n');
+
+						foreach (string command in commands)
+						{
+							if (!string.IsNullOrWhiteSpace(command))
+							{
+								lock (commandLock)
+								{
+									pendingCommands.Enqueue(command.Trim());
+								}
+
+								LogCommand("RECEIVED", command.Trim());
+							}
+						}
+					}
+					else
+					{
+						break; // Client disconnected
+					}
+				}
+				catch (Exception ex)
+				{
+					LogCommand("ERROR", $"Command receive error: {ex.Message}");
+					break;
+				}
+			}
+		}
+
+		private void UpdateClientCounts()
+		{
+			clientCountLabel.Text = $"Video clients: {connectedClients}";
+			commandStatusLabel.Text = $"Command clients: {connectedCommandClients}";
+		}
+
+		private void LogCommand(string type, string message)
+		{
+			if (this.InvokeRequired)
+			{
+				this.Invoke(new Action(() => LogCommand(type, message)));
+				return;
+			}
+
+			string timestamp = DateTime.Now.ToString("HH:mm:ss");
+			string logEntry = $"[{timestamp}] [{type}] {message}\n";
+
+			commandLogTextBox.AppendText(logEntry);
+			commandLogTextBox.ScrollToCaret();
+
+			// Keep log size manageable
+			if (commandLogTextBox.Lines.Length > 1000)
+			{
+				string[] lines = commandLogTextBox.Lines;
+				string[] keepLines = new string[500];
+				Array.Copy(lines, lines.Length - 500, keepLines, 0, 500);
+				commandLogTextBox.Lines = keepLines;
+			}
 		}
 
 		private void StreamToClient(TcpClient client)
@@ -430,6 +841,13 @@ namespace VideoStreamingServer
 			{
 				try
 				{
+					// If stream is paused, send a pause indicator frame or just wait
+					if (streamPaused)
+					{
+						Thread.Sleep(100);
+						continue;
+					}
+
 					byte[] frameData = null;
 
 					lock (frameLock)
@@ -497,7 +915,7 @@ namespace VideoStreamingServer
 					if (jpegCodec != null)
 					{
 						EncoderParameters encoderParams = new EncoderParameters(1);
-						encoderParams.Param[0] = new EncoderParameter(Encoder.Quality, quality);
+						encoderParams.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, quality);
 
 						bitmap.Save(stream, jpegCodec, encoderParams);
 						encoderParams.Dispose();
@@ -543,10 +961,16 @@ namespace VideoStreamingServer
 			isStreaming = false;
 			CleanupCamera();
 			tcpListener?.Stop();
+			commandListener?.Stop();
 
 			if (serverThread != null && serverThread.IsAlive)
 			{
 				serverThread.Join(2000);
+			}
+
+			if (commandThread != null && commandThread.IsAlive)
+			{
+				commandThread.Join(2000);
 			}
 
 			base.OnFormClosing(e);
