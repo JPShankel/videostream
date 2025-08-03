@@ -1,19 +1,19 @@
-using Accord.Video.VFW;
-using System.Diagnostics;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
-using SystemDrawing = System.Drawing;
-using SystemDrawingImaging = System.Drawing.Imaging;
-
+using OpenCvSharp;
+using OpenCvSharp.Extensions;
 
 namespace VideoStreamRecorder.Forms
 {
-	public partial class RecorderMainForm : Form
+	public partial class VideoStreamRecorderForm : Form
 	{
-		// Network connection
-		private TcpClient? tcpClient;
-		private NetworkStream? networkStream;
+		// Network connections
+		private TcpClient? videoClient;
+		private TcpClient? commandClient;
+		private NetworkStream? videoStream;
+		private NetworkStream? commandStream;
 		private bool isConnected = false;
 
 		// Recording state
@@ -21,70 +21,25 @@ namespace VideoStreamRecorder.Forms
 		private DateTime recordingStartTime;
 		private CancellationTokenSource? cancellationTokenSource;
 
-		// Recording streams and video processing
-		private FileStream? rawVideoStream;
+		// Video processing
+		private VideoWriter? videoWriter;
 		private StreamWriter? commandLogWriter;
-		private AVIWriter? aviWriter;
-		private MemoryStream? frameBuffer;
-
-		// Video settings
-		private int videoWidth = 1920;
-		private int videoHeight = 1080;
-		private int videoFrameRate = 30;
-		private int videoQuality = 75; // VFW quality (0-100)
+		private Mat? currentFrame;
+		private List<byte> frameBuffer = new List<byte>();
+		private bool expectingFrameHeader = true;
+		private int expectedFrameSize = 0;
 
 		// Statistics
-		private int framesReceived = 0;
-		private int commandsReceived = 0;
-		private long totalDataReceived = 0;
+		private int frameCount = 0;
+		private int commandCount = 0;
+		private DateTime lastFrameTime = DateTime.MinValue;
 		private bool isFirstCommand = true;
 
 		// Recording files
-		private string? currentVideoFileName;
-		private string? currentCommandFileName;
-		private string? currentRawVideoFileName;
+		private string? currentVideoFile;
+		private string? currentCommandFile;
 
-		private void InitializeVideoWriter()
-		{
-			try
-			{
-				// Get resolution settings
-				var resolution = comboBoxVideoResolution.Text.Split('x');
-				videoWidth = int.Parse(resolution[0]);
-				videoHeight = int.Parse(resolution[1]);
-
-				// Get quality settings for VFW quality (0-100)
-				var qualityIndex = comboBoxVideoQuality.SelectedIndex;
-				videoQuality = qualityIndex switch
-				{
-					0 => 90,  // High quality
-					1 => 75,  // Medium quality  
-					2 => 50,  // Low quality
-					_ => 75   // Default
-				};
-
-				// Initialize Accord VFW AVI writer
-				aviWriter = new AVIWriter();
-				aviWriter.Open(currentVideoFileName!, videoWidth, videoHeight);
-				aviWriter.FrameRate = videoFrameRate;
-				aviWriter.Quality = videoQuality;
-
-				frameBuffer = new MemoryStream();
-
-				LogMessage($"Accord VFW writer initialized for AVI ({videoWidth}x{videoHeight}, Quality: {videoQuality}%)");
-			}
-			catch (Exception ex)
-			{
-				LogMessage($"Error initializing VFW video writer: {ex.Message}");
-
-				// Fallback to raw file recording
-				currentRawVideoFileName = currentVideoFileName!.Replace(".avi", ".raw");
-				rawVideoStream = new FileStream(currentRawVideoFileName, FileMode.Create, FileAccess.Write);
-				LogMessage("Fallback: Recording to raw video file");
-			}
-		}
-
-		public RecorderMainForm()
+		public VideoStreamRecorderForm()
 		{
 			InitializeComponent();
 			InitializeForm();
@@ -92,30 +47,28 @@ namespace VideoStreamRecorder.Forms
 
 		private void InitializeForm()
 		{
-			// Set application icon
-			//this.Icon = SystemDrawing.SystemIcons.Application;
-
-			// Initialize timer
+			this.Icon = SystemIcons.Application;
 			timerUpdate.Start();
 
-			// Set initial UI state
-			UpdateUIState();
+			// Create recordings directory
+			if (!Directory.Exists("recordings"))
+			{
+				Directory.CreateDirectory("recordings");
+			}
 
 			LogMessage("Video Stream Recorder initialized");
-			LogMessage($"Ready to connect to server");
+			LogMessage("Ready to connect to server with dual streams");
 		}
 
 		#region Form Events
 
-		private void RecorderMainForm_Load(object sender, EventArgs e)
+		private void VideoStreamRecorderForm_Load(object sender, EventArgs e)
 		{
 			LogMessage("Application started");
-
-			// Create recordings directory if it doesn't exist
-			CreateOutputDirectory();
+			UpdateUI();
 		}
 
-		private void RecorderMainForm_FormClosing(object sender, FormClosingEventArgs e)
+		private void VideoStreamRecorderForm_FormClosing(object sender, FormClosingEventArgs e)
 		{
 			if (isRecording)
 			{
@@ -130,10 +83,9 @@ namespace VideoStreamRecorder.Forms
 					e.Cancel = true;
 					return;
 				}
-
-				StopRecording();
 			}
 
+			StopRecording();
 			DisconnectFromServer();
 		}
 
@@ -164,29 +116,48 @@ namespace VideoStreamRecorder.Forms
 			{
 				buttonConnect.Enabled = false;
 				buttonConnect.Text = "Connecting...";
-				LogMessage($"Connecting to {textBoxServerIP.Text}:{numericUpDownPort.Value}...");
 
-				tcpClient = new TcpClient();
-				await tcpClient.ConnectAsync(textBoxServerIP.Text, (int)numericUpDownPort.Value);
-				networkStream = tcpClient.GetStream();
+				var serverIP = textBoxServerIP.Text;
+				var videoPort = (int)numericUpDownVideoPort.Value;
+				var commandPort = (int)numericUpDownCommandPort.Value;
+
+				LogMessage($"Connecting to video stream at {serverIP}:{videoPort}");
+				LogMessage($"Connecting to command stream at {serverIP}:{commandPort}");
+
+				// Connect to video stream
+				videoClient = new TcpClient();
+				await videoClient.ConnectAsync(serverIP, videoPort);
+				videoStream = videoClient.GetStream();
+				LogMessage("Video stream connected");
+
+				// Connect to command stream
+				commandClient = new TcpClient();
+				await commandClient.ConnectAsync(serverIP, commandPort);
+				commandStream = commandClient.GetStream();
+				LogMessage("Command stream connected");
 
 				isConnected = true;
-				UpdateUIState();
+				UpdateUI();
 
-				LogMessage("Connected successfully");
+				LogMessage("Connected to both video and command streams");
 
-				// Start receiving data
+				// Reset frame buffer
+				frameBuffer.Clear();
+				expectingFrameHeader = true;
+				expectedFrameSize = 0;
+
+				// Start receiving data from both streams
 				cancellationTokenSource = new CancellationTokenSource();
-				_ = Task.Run(() => ReceiveDataAsync(cancellationTokenSource.Token));
+				_ = Task.Run(() => ReceiveVideoDataAsync(cancellationTokenSource.Token));
+				_ = Task.Run(() => ReceiveCommandDataAsync(cancellationTokenSource.Token));
 			}
 			catch (Exception ex)
 			{
 				LogMessage($"Connection failed: {ex.Message}");
-
 				MessageBox.Show($"Failed to connect: {ex.Message}", "Connection Error",
 					MessageBoxButtons.OK, MessageBoxIcon.Error);
 
-				UpdateUIState();
+				DisconnectFromServer();
 			}
 			finally
 			{
@@ -198,23 +169,472 @@ namespace VideoStreamRecorder.Forms
 		{
 			try
 			{
-				if (isRecording)
-				{
-					StopRecording();
-				}
+				StopRecording();
 
 				isConnected = false;
 				cancellationTokenSource?.Cancel();
 
-				networkStream?.Close();
-				tcpClient?.Close();
+				videoStream?.Close();
+				videoClient?.Close();
+				commandStream?.Close();
+				commandClient?.Close();
 
-				UpdateUIState();
+				// Reset counters and buffers
+				frameCount = 0;
+				commandCount = 0;
+				frameBuffer.Clear();
+				expectingFrameHeader = true;
+				expectedFrameSize = 0;
+
+				UpdateUI();
 				LogMessage("Disconnected from server");
+
+				// Clear preview
+				pictureBoxVideo.Image?.Dispose();
+				pictureBoxVideo.Image = null;
 			}
 			catch (Exception ex)
 			{
 				LogMessage($"Error during disconnection: {ex.Message}");
+			}
+		}
+
+		#endregion
+
+		#region Video Stream Processing
+
+		private async Task ReceiveVideoDataAsync(CancellationToken cancellationToken)
+		{
+			byte[] buffer = new byte[65536]; // Increased buffer size for video frames
+
+			try
+			{
+				LogMessage("Starting video data reception");
+
+				while (isConnected && !cancellationToken.IsCancellationRequested)
+				{
+					if (videoStream != null && videoStream.CanRead)
+					{
+						int bytesRead = await videoStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
+
+						if (bytesRead == 0)
+						{
+							Invoke(() => LogMessage("Video stream closed by server"));
+							break;
+						}
+
+						// Add received data to frame buffer
+						for (int i = 0; i < bytesRead; i++)
+						{
+							frameBuffer.Add(buffer[i]);
+						}
+
+						// Process complete frames from buffer
+						await ProcessFrameBufferAsync(cancellationToken);
+					}
+					else
+					{
+						await Task.Delay(10, cancellationToken);
+					}
+				}
+			}
+			catch (OperationCanceledException)
+			{
+				LogMessage("Video reception cancelled");
+			}
+			catch (Exception ex)
+			{
+				Invoke(() => LogMessage($"Video stream error: {ex.Message}"));
+			}
+		}
+
+		private async Task ProcessFrameBufferAsync(CancellationToken cancellationToken)
+		{
+			try
+			{
+				while (frameBuffer.Count > 0)
+				{
+					if (expectingFrameHeader)
+					{
+						// Look for frame header/size information
+						if (TryParseFrameHeader(out int frameSize))
+						{
+							expectedFrameSize = frameSize;
+							expectingFrameHeader = false;
+						}
+						else
+						{
+							break; // Not enough data for header
+						}
+					}
+					else
+					{
+						// Check if we have complete frame data
+						if (frameBuffer.Count >= expectedFrameSize)
+						{
+							var frameData = frameBuffer.Take(expectedFrameSize).ToArray();
+							frameBuffer.RemoveRange(0, expectedFrameSize);
+
+							await ProcessCompleteVideoFrameAsync(frameData, cancellationToken);
+
+							expectingFrameHeader = true;
+							expectedFrameSize = 0;
+						}
+						else
+						{
+							break; // Not enough data for complete frame
+						}
+					}
+				}
+			}
+			catch (Exception ex)
+			{
+				Invoke(() => LogMessage($"Error processing frame buffer: {ex.Message}"));
+			}
+		}
+
+		private bool TryParseFrameHeader(out int frameSize)
+		{
+			frameSize = 0;
+
+			// Method 1: Look for JPEG header and try to determine size
+			if (frameBuffer.Count >= 2 && frameBuffer[0] == 0xFF && frameBuffer[1] == 0xD8)
+			{
+				// Find JPEG end marker (0xFF 0xD9)
+				for (int i = 2; i < frameBuffer.Count - 1; i++)
+				{
+					if (frameBuffer[i] == 0xFF && frameBuffer[i + 1] == 0xD9)
+					{
+						frameSize = i + 2;
+						return true;
+					}
+				}
+				return false; // JPEG not complete yet
+			}
+
+			// Method 2: Look for PNG header and try to determine size
+			if (frameBuffer.Count >= 8 &&
+				frameBuffer[0] == 0x89 && frameBuffer[1] == 0x50 &&
+				frameBuffer[2] == 0x4E && frameBuffer[3] == 0x47)
+			{
+				// Look for PNG end chunk (IEND)
+				for (int i = 8; i < frameBuffer.Count - 7; i++)
+				{
+					if (frameBuffer[i] == 0x49 && frameBuffer[i + 1] == 0x45 &&
+						frameBuffer[i + 2] == 0x4E && frameBuffer[i + 3] == 0x44)
+					{
+						frameSize = i + 8; // Include CRC
+						return true;
+					}
+				}
+				return false; // PNG not complete yet
+			}
+
+			// Method 3: If using a custom protocol with size header
+			if (frameBuffer.Count >= 4)
+			{
+				// Assuming first 4 bytes are frame size (little-endian)
+				frameSize = BitConverter.ToInt32(frameBuffer.Take(4).ToArray(), 0);
+				if (frameSize > 0 && frameSize < 10 * 1024 * 1024) // Sanity check: < 10MB
+				{
+					frameBuffer.RemoveRange(0, 4); // Remove header
+					return true;
+				}
+			}
+
+			// Method 4: Assume fixed raw frame size (fallback)
+			int rawFrameSize = 640 * 480 * 3; // BGR format
+			if (frameBuffer.Count >= rawFrameSize)
+			{
+				frameSize = rawFrameSize;
+				return true;
+			}
+
+			return false;
+		}
+
+		private async Task ProcessCompleteVideoFrameAsync(byte[] frameData, CancellationToken cancellationToken)
+		{
+			try
+			{
+				Mat? frame = null;
+
+				// Method 1: Try to decode as image (JPEG, PNG, etc.)
+				if (IsImageData(frameData))
+				{
+					using var memoryStream = new MemoryStream(frameData);
+					try
+					{
+						using var bitmap = new Bitmap(memoryStream);
+						frame = BitmapConverter.ToMat(bitmap);
+					}
+					catch (Exception ex)
+					{
+						LogMessage($"Image decode failed: {ex.Message}");
+						frame = null;
+					}
+				}
+
+				// Method 2: Try as raw pixel data if image decode failed
+				if (frame == null && IsRawPixelData(frameData))
+				{
+					int width = 640;  // Adjust based on your stream
+					int height = 480; // Adjust based on your stream
+
+					if (frameData.Length >= width * height * 3)
+					{
+						try
+						{
+							frame = new Mat(height, width, MatType.CV_8UC3);
+							Marshal.Copy(frameData, 0, frame.Data, Math.Min(frameData.Length, width * height * 3));
+							LogMessage($"Processed raw frame: {frame.Width}x{frame.Height}");
+						}
+						catch (Exception ex)
+						{
+							LogMessage($"Raw frame processing failed: {ex.Message}");
+							frame?.Dispose();
+							frame = null;
+						}
+					}
+				}
+
+				// Method 3: Create visualization frame if unable to decode
+				if (frame == null)
+				{
+					frame = CreateVisualizationFrame(frameData);
+					LogMessage("Using visualization frame (no video data decoded)");
+				}
+
+				// Ensure frame is the correct size for video writer
+				if (frame != null)
+				{
+					// Resize frame to match video writer size if needed
+					if (isRecording && videoWriter != null &&
+						(frame.Width != 640 || frame.Height != 480))
+					{
+						var resizedFrame = new Mat();
+						Cv2.Resize(frame, resizedFrame, new OpenCvSharp.Size(640, 480));
+						frame.Dispose();
+						frame = resizedFrame;
+					}
+
+					AddFrameOverlays(frame);
+
+					// Write frame to video file if recording
+					if (isRecording && videoWriter != null && videoWriter.IsOpened())
+					{
+						try
+						{
+							videoWriter.Write(frame);
+							// Force flush to ensure frame is written
+							// Note: OpenCV doesn't have a direct flush, but this ensures the write operation completes
+						}
+						catch (Exception ex)
+						{
+							LogMessage($"Error writing frame to video: {ex.Message}");
+						}
+					}
+
+					// Update preview
+					Invoke(() => UpdateVideoPreview(frame));
+
+					// Update frame count and time
+					Invoke(() =>
+					{
+						frameCount++;
+						lastFrameTime = DateTime.Now;
+					});
+
+					frame.Dispose();
+				}
+
+				await Task.CompletedTask;
+			}
+			catch (Exception ex)
+			{
+				Invoke(() => LogMessage($"Error processing complete video frame: {ex.Message}"));
+			}
+		}
+
+		private Mat CreateVisualizationFrame(byte[] frameData)
+		{
+			var frame = new Mat(480, 640, MatType.CV_8UC3, new Scalar(30, 30, 30));
+
+			// Add header info
+			Cv2.PutText(frame, "Video Stream Data", new OpenCvSharp.Point(20, 40),
+				HersheyFonts.HersheySimplex, 1.2, new Scalar(0, 255, 0), 2);
+
+			// Show data statistics
+			Cv2.PutText(frame, $"Data size: {frameData.Length} bytes", new OpenCvSharp.Point(20, 80),
+				HersheyFonts.HersheySimplex, 0.8, new Scalar(255, 255, 255), 2);
+
+			Cv2.PutText(frame, $"Frame count: {frameCount + 1}", new OpenCvSharp.Point(20, 120),
+				HersheyFonts.HersheySimplex, 0.8, new Scalar(255, 255, 255), 2);
+
+			// Show first 64 bytes as a visual pattern
+			Cv2.PutText(frame, "Data pattern:", new OpenCvSharp.Point(20, 160),
+				HersheyFonts.HersheySimplex, 0.6, new Scalar(200, 200, 200), 1);
+
+			for (int i = 0; i < Math.Min(64, frameData.Length); i++)
+			{
+				int x = 20 + (i % 32) * 18;
+				int y = 180 + (i / 32) * 18;
+				byte value = frameData[i];
+
+				// Create colored square based on byte value
+				var color = new Scalar(value, (255 - value), (value + 128) % 256);
+				Cv2.Rectangle(frame, new OpenCvSharp.Point(x, y), new OpenCvSharp.Point(x + 15, y + 15), color, -1);
+			}
+
+			// Add hex dump of first 16 bytes
+			var hexString = string.Join(" ", frameData.Take(16).Select(b => b.ToString("X2")));
+			Cv2.PutText(frame, $"Hex: {hexString}", new OpenCvSharp.Point(20, 240),
+				HersheyFonts.HersheySimplex, 0.5, new Scalar(180, 180, 180), 1);
+
+			return frame;
+		}
+
+		private void AddFrameOverlays(Mat frame)
+		{
+			// Add timestamp
+			var timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
+			Cv2.PutText(frame, timestamp, new OpenCvSharp.Point(10, frame.Height - 10),
+				HersheyFonts.HersheySimplex, 0.6, new Scalar(255, 255, 255), 1);
+
+			// Add recording indicator
+			if (isRecording)
+			{
+				Cv2.Circle(frame, new OpenCvSharp.Point(frame.Width - 50, 50), 25, new Scalar(0, 0, 255), -1);
+				Cv2.PutText(frame, "REC", new OpenCvSharp.Point(frame.Width - 70, 60),
+					HersheyFonts.HersheySimplex, 0.8, new Scalar(255, 255, 255), 2);
+			}
+		}
+
+		// Helper method to detect image data
+		private bool IsImageData(byte[] buffer)
+		{
+			if (buffer.Length < 4) return false;
+
+			// Check for JPEG signature
+			if (buffer[0] == 0xFF && buffer[1] == 0xD8 && buffer[2] == 0xFF)
+				return true;
+
+			// Check for PNG signature
+			if (buffer[0] == 0x89 && buffer[1] == 0x50 && buffer[2] == 0x4E && buffer[3] == 0x47)
+				return true;
+
+			// Check for BMP signature
+			if (buffer[0] == 0x42 && buffer[1] == 0x4D)
+				return true;
+
+			return false;
+		}
+
+		// Helper method to detect raw pixel data
+		private bool IsRawPixelData(byte[] buffer)
+		{
+			// Check for common frame sizes
+			int[] commonSizes = {
+				640 * 480 * 3,    // VGA BGR
+				640 * 480 * 4,    // VGA BGRA
+				1280 * 720 * 3,   // HD BGR
+				1280 * 720 * 4,   // HD BGRA
+				1920 * 1080 * 3,  // Full HD BGR
+				1920 * 1080 * 4   // Full HD BGRA
+			};
+
+			return commonSizes.Contains(buffer.Length);
+		}
+
+		#endregion
+
+		#region Command Stream Processing
+
+		private async Task ReceiveCommandDataAsync(CancellationToken cancellationToken)
+		{
+			byte[] buffer = new byte[1024];
+			StringBuilder messageBuffer = new StringBuilder();
+
+			try
+			{
+				LogMessage("Starting command data reception");
+
+				while (isConnected && !cancellationToken.IsCancellationRequested)
+				{
+					if (commandStream != null && commandStream.CanRead)
+					{
+						int bytesRead = await commandStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
+
+						if (bytesRead == 0)
+						{
+							Invoke(() => LogMessage("Command stream closed by server"));
+							break;
+						}
+
+						string data = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+						messageBuffer.Append(data);
+
+						// Process complete command messages
+						ProcessCommandMessages(messageBuffer);
+					}
+					else
+					{
+						await Task.Delay(10, cancellationToken);
+					}
+				}
+			}
+			catch (OperationCanceledException)
+			{
+				LogMessage("Command reception cancelled");
+			}
+			catch (Exception ex)
+			{
+				Invoke(() => LogMessage($"Command stream error: {ex.Message}"));
+			}
+		}
+
+		private void ProcessCommandMessages(StringBuilder messageBuffer)
+		{
+			try
+			{
+				string content = messageBuffer.ToString();
+				string[] lines = content.Split('\n');
+
+				for (int i = 0; i < lines.Length - 1; i++)
+				{
+					if (!string.IsNullOrWhiteSpace(lines[i]))
+					{
+						var command = new CommandEntry
+						{
+							Timestamp = DateTime.UtcNow,
+							Command = lines[i].Trim(),
+							Source = "command_stream"
+						};
+
+						// Save to command log if recording
+						if (isRecording && commandLogWriter != null)
+						{
+							SaveCommandToLog(command);
+						}
+
+						Invoke(() =>
+						{
+							commandCount++;
+							LogMessage($"Command: {command.Command}");
+						});
+					}
+				}
+
+				// Keep the last incomplete line
+				messageBuffer.Clear();
+				if (lines.Length > 0)
+				{
+					messageBuffer.Append(lines[lines.Length - 1]);
+				}
+			}
+			catch (Exception ex)
+			{
+				Invoke(() => LogMessage($"Error processing commands: {ex.Message}"));
 			}
 		}
 
@@ -243,83 +663,84 @@ namespace VideoStreamRecorder.Forms
 
 			try
 			{
-				// Create output files
 				var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
 				var outputDir = textBoxOutputPath.Text;
 
-				if (checkBoxRecordVideo.Checked)
+				if (!Directory.Exists(outputDir))
 				{
-					currentVideoFileName = Path.Combine(outputDir, $"video_{timestamp}.avi");
-
-					// Initialize AForge video writer
-					InitializeVideoWriter();
-
-					LogMessage($"Video recording to: {currentVideoFileName}");
+					Directory.CreateDirectory(outputDir);
 				}
 
-				if (checkBoxRecordCommands.Checked)
+				// Initialize video recording with raw codec
+				currentVideoFile = Path.Combine(outputDir, $"video_{timestamp}.avi");
+
+				// Try multiple raw codec options
+				bool writerInitialized = false;
+
+				// Option 1: Uncompressed RGB
+				int fourcc = VideoWriter.FourCC('D', 'I', 'B', ' '); // DIB (raw RGB)
+				videoWriter = new VideoWriter(currentVideoFile, fourcc, 30.0, new OpenCvSharp.Size(640, 480), true);
+
+				if (videoWriter.IsOpened())
 				{
-					currentCommandFileName = Path.Combine(outputDir, $"commands_{timestamp}.json");
-					commandLogWriter = new StreamWriter(currentCommandFileName, false, Encoding.UTF8);
-					commandLogWriter.WriteLine("[");
-					isFirstCommand = true;
-					LogMessage($"Command recording to: {currentCommandFileName}");
+					writerInitialized = true;
+					LogMessage("Video writer initialized with DIB codec");
 				}
+
+				if (!writerInitialized)
+				{
+					// Option 2: Try raw (0)
+					videoWriter?.Release();
+					videoWriter = new VideoWriter(currentVideoFile, 0, 30.0, new OpenCvSharp.Size(640, 480), true);
+
+					if (videoWriter.IsOpened())
+					{
+						writerInitialized = true;
+						LogMessage("Video writer initialized with raw codec (0)");
+					}
+				}
+
+				if (!writerInitialized)
+				{
+					// Option 3: Use MJPG as reliable fallback (nearly lossless)
+					videoWriter?.Release();
+					fourcc = VideoWriter.FourCC('M', 'J', 'P', 'G');
+					videoWriter = new VideoWriter(currentVideoFile, fourcc, 30.0, new OpenCvSharp.Size(640, 480), true);
+
+					if (videoWriter.IsOpened())
+					{
+						writerInitialized = true;
+						LogMessage("Video writer initialized with MJPG codec (fallback)");
+					}
+				}
+
+				if (!writerInitialized)
+				{
+					videoWriter?.Release();
+					videoWriter = null;
+					throw new Exception("Failed to initialize video writer with any codec");
+				}
+
+				// Initialize command recording
+				currentCommandFile = Path.Combine(outputDir, $"commands_{timestamp}.json");
+				commandLogWriter = new StreamWriter(currentCommandFile, false, Encoding.UTF8);
+				commandLogWriter.WriteLine("[");
+				isFirstCommand = true;
 
 				isRecording = true;
 				recordingStartTime = DateTime.Now;
 
-				// Reset counters
-				framesReceived = 0;
-				commandsReceived = 0;
-				totalDataReceived = 0;
-
-				UpdateUIState();
+				UpdateUI();
 				LogMessage("Recording started");
+				LogMessage($"Video file: {currentVideoFile}");
+				LogMessage($"Command file: {currentCommandFile}");
 			}
 			catch (Exception ex)
 			{
 				LogMessage($"Error starting recording: {ex.Message}");
 				MessageBox.Show($"Error starting recording: {ex.Message}", "Recording Error",
 					MessageBoxButtons.OK, MessageBoxIcon.Error);
-			}
-		}
-
-		private void StartFFmpegEncoding()
-		{
-			try
-			{
-				// Configure FFmpeg for real-time encoding
-				var ffmpegArgs = "-f rawvideo -pixel_format yuv420p -video_size 1920x1080 -framerate 30 " +
-							   $"-i pipe:0 -c:v libx264 -preset ultrafast -crf 23 -f mp4 \"{currentVideoFileName}\"";
-
-				var ffmpegProcess = new Process
-				{
-					StartInfo = new ProcessStartInfo
-					{
-						FileName = "ffmpeg",
-						Arguments = ffmpegArgs,
-						UseShellExecute = false,
-						RedirectStandardInput = true,
-						RedirectStandardOutput = true,
-						RedirectStandardError = true,
-						CreateNoWindow = true
-					}
-				};
-
-				ffmpegProcess.Start();
-				var ffmpegInputStream = ffmpegProcess.StandardInput.BaseStream;
-
-				LogMessage("FFmpeg encoder started for real-time MP4 encoding");
-			}
-			catch (Exception ex)
-			{
-				LogMessage($"Error starting FFmpeg: {ex.Message}");
-				LogMessage("Note: FFmpeg must be installed and accessible from PATH");
-
-				// Fallback to raw file recording
-				rawVideoStream = new FileStream(currentRawVideoFileName!, FileMode.Create, FileAccess.Write);
-				LogMessage("Fallback: Recording to raw video file");
+				StopRecording();
 			}
 		}
 
@@ -331,53 +752,44 @@ namespace VideoStreamRecorder.Forms
 			{
 				isRecording = false;
 
-				// Close Accord VFW video writer
-				if (aviWriter != null)
+				// Close video writer with proper flushing
+				if (videoWriter != null)
 				{
 					try
 					{
-						aviWriter.Close();
-						aviWriter.Dispose();
-						aviWriter = null;
-						LogMessage($"AVI video saved successfully: {currentVideoFileName}");
+						// Ensure all frames are written before closing
+						videoWriter.Release();
+						videoWriter.Dispose();
+						videoWriter = null;
+
+						// Add small delay to ensure file is fully written
+						Thread.Sleep(100);
+
+						if (File.Exists(currentVideoFile!))
+						{
+							var fileInfo = new FileInfo(currentVideoFile);
+							LogMessage($"Video recording saved: {currentVideoFile}");
+							LogMessage($"Video file size: {fileInfo.Length / 1024.0:F2} KB");
+							LogMessage($"Frames recorded: {frameCount}");
+
+							// Verify file has content
+							if (fileInfo.Length == 0)
+							{
+								LogMessage("WARNING: Video file is empty - no frames were written");
+							}
+							else if (fileInfo.Length < 1000)
+							{
+								LogMessage("WARNING: Video file is very small - may contain no valid frames");
+							}
+						}
 					}
-					catch (Exception ex)
+					catch (Exception videoEx)
 					{
-						LogMessage($"Error closing VFW video writer: {ex.Message}");
+						LogMessage($"Error closing video writer: {videoEx.Message}");
 					}
 				}
 
-				// Close frame buffer
-				if (frameBuffer != null)
-				{
-					try
-					{
-						frameBuffer.Dispose();
-						frameBuffer = null;
-					}
-					catch (Exception ex)
-					{
-						LogMessage($"Error disposing frame buffer: {ex.Message}");
-					}
-				}
-
-				// Close raw video file (fallback mode)
-				if (rawVideoStream != null)
-				{
-					try
-					{
-						rawVideoStream.Close();
-						rawVideoStream.Dispose();
-						rawVideoStream = null;
-						LogMessage($"Raw video file saved: {currentRawVideoFileName}");
-					}
-					catch (Exception ex)
-					{
-						LogMessage($"Error closing raw video stream: {ex.Message}");
-					}
-				}
-
-				// Close command file
+				// Close command log
 				if (commandLogWriter != null)
 				{
 					try
@@ -386,19 +798,19 @@ namespace VideoStreamRecorder.Forms
 						commandLogWriter.Close();
 						commandLogWriter.Dispose();
 						commandLogWriter = null;
-						LogMessage($"Command log saved: {currentCommandFileName}");
+						LogMessage($"Command log saved: {currentCommandFile}");
 					}
-					catch (Exception ex)
+					catch (Exception cmdEx)
 					{
-						LogMessage($"Error closing command log: {ex.Message}");
+						LogMessage($"Error closing command log: {cmdEx.Message}");
 					}
 				}
 
-				UpdateUIState();
-
 				var duration = DateTime.Now - recordingStartTime;
 				LogMessage($"Recording stopped. Duration: {duration:hh\\:mm\\:ss}");
-				LogMessage($"Total frames: {framesReceived}, Commands: {commandsReceived}");
+				LogMessage($"Total frames processed: {frameCount}, Commands: {commandCount}");
+
+				UpdateUI();
 			}
 			catch (Exception ex)
 			{
@@ -406,208 +818,7 @@ namespace VideoStreamRecorder.Forms
 			}
 		}
 
-		private async Task ProcessVideoFrameAsync(byte[] buffer, int bytesRead, CancellationToken cancellationToken)
-		{
-			try
-			{
-				// Add the new data to the frame buffer
-				if (frameBuffer == null)
-					frameBuffer = new MemoryStream();
-
-				await frameBuffer.WriteAsync(buffer, 0, bytesRead, cancellationToken);
-
-				// Calculate expected frame size (assuming RGB24 format)
-				int expectedFrameSize = videoWidth * videoHeight * 3;
-
-				// If we have enough data for a complete frame
-				if (frameBuffer.Length >= expectedFrameSize)
-				{
-					// Extract one frame worth of data
-					byte[] frameData = new byte[expectedFrameSize];
-					frameBuffer.Position = 0;
-					await frameBuffer.ReadAsync(frameData, 0, expectedFrameSize, cancellationToken);
-
-					// Move remaining data to beginning of buffer
-					var remainingData = new byte[frameBuffer.Length - expectedFrameSize];
-					await frameBuffer.ReadAsync(remainingData, 0, remainingData.Length, cancellationToken);
-
-					frameBuffer.SetLength(0);
-					await frameBuffer.WriteAsync(remainingData, 0, remainingData.Length, cancellationToken);
-
-					// Convert raw bytes to bitmap
-					var bitmap = CreateBitmapFromRawData(frameData, videoWidth, videoHeight);
-
-					if (bitmap.Value != null)
-					{
-						// Write frame to AVI file using VFW
-						aviWriter?.AddFrame(bitmap.Value);
-						bitmap.Value.Dispose();
-					}
-				}
-			}
-			catch (Exception ex)
-			{
-				LogMessage($"Error processing video frame: {ex.Message}");
-			}
-		}
-
-		// Replace ambiguous 'Bitmap' and 'PixelFormat' usages with fully qualified names from System.Drawing.Common
-
-		private global::System.Drawing.Bitmap? CreateBitmapFromRawData(byte[] data, int width, int height)
-		{
-			try
-			{
-				// Create bitmap from raw RGB data using System.Drawing.Common
-				var bitmap = new global::System.Drawing.Bitmap(width, height, global::System.Drawing.Imaging.PixelFormat.Format24bppRgb);
-				var bitmapData = bitmap.LockBits(
-					new global::System.Drawing.Rectangle(0, 0, width, height),
-					global::System.Drawing.Imaging.ImageLockMode.WriteOnly,
-					global::System.Drawing.Imaging.PixelFormat.Format24bppRgb
-				);
-
-				// Copy raw data to bitmap
-				System.Runtime.InteropServices.Marshal.Copy(data, 0, bitmapData.Scan0, Math.Min(data.Length, bitmapData.Stride * height));
-
-				bitmap.UnlockBits(bitmapData);
-				return bitmap;
-			}
-			catch (Exception ex)
-			{
-				LogMessage($"Error creating bitmap: {ex.Message}");
-				return null;
-			}
-		}
-
-		private async Task ConvertRawToMp4Async()
-		{
-			// This method is no longer needed with AForge.NET
-			// AForge handles the conversion directly
-			await Task.CompletedTask;
-		}
-
-		#endregion
-
-		#region Data Processing
-
-		private async Task ReceiveDataAsync(CancellationToken cancellationToken)
-		{
-			byte[] buffer = new byte[4096];
-			StringBuilder messageBuffer = new StringBuilder();
-
-			try
-			{
-				while (isConnected && !cancellationToken.IsCancellationRequested)
-				{
-					if (networkStream != null && networkStream.CanRead)
-					{
-						int bytesRead = await networkStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
-
-						if (bytesRead == 0)
-						{
-							Invoke(() => LogMessage("Server closed the connection"));
-							break;
-						}
-
-						totalDataReceived += bytesRead;
-
-						// Try to determine if this is command data or video data
-						string dataString = Encoding.UTF8.GetString(buffer, 0, Math.Min(bytesRead, 100));
-
-						if (IsLikelyCommandData(dataString))
-						{
-							// Process as command data
-							string fullData = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-							messageBuffer.Append(fullData);
-							ProcessCommandData(messageBuffer);
-						}
-						else
-						{
-							// Process as video frame data
-							if (isRecording && checkBoxRecordVideo.Checked)
-							{
-								if (aviWriter != null)
-								{
-									// Convert raw bytes to bitmap and write to video
-									await ProcessVideoFrameAsync(buffer, bytesRead, cancellationToken);
-								}
-								else if (rawVideoStream != null)
-								{
-									// Fallback: write to raw file
-									await rawVideoStream.WriteAsync(buffer, 0, bytesRead, cancellationToken);
-									await rawVideoStream.FlushAsync(cancellationToken);
-								}
-							}
-							Invoke(() => framesReceived++);
-						}
-					}
-					else
-					{
-						await Task.Delay(10, cancellationToken);
-					}
-				}
-			}
-			catch (OperationCanceledException)
-			{
-				// Expected when cancellation is requested
-			}
-			catch (Exception ex)
-			{
-				Invoke(() => LogMessage($"Data reception error: {ex.Message}"));
-			}
-		}
-
-		private bool IsLikelyCommandData(string data)
-		{
-			// Simple heuristic to detect command data vs binary video data
-			return data.All(c => char.IsControl(c) || (c >= 32 && c <= 126)) &&
-				   (data.Contains("{") || data.Contains("command") || data.Contains(":"));
-		}
-
-		private void ProcessCommandData(StringBuilder messageBuffer)
-		{
-			try
-			{
-				string bufferContent = messageBuffer.ToString();
-				string[] lines = bufferContent.Split('\n');
-
-				for (int i = 0; i < lines.Length - 1; i++)
-				{
-					if (!string.IsNullOrWhiteSpace(lines[i]))
-					{
-						var command = new CommandEntry
-						{
-							Timestamp = DateTime.UtcNow,
-							Command = lines[i].Trim(),
-							Source = "stream"
-						};
-
-						if (isRecording && checkBoxRecordCommands.Checked && commandLogWriter != null)
-						{
-							WriteCommandToLog(command);
-						}
-
-						Invoke(() =>
-						{
-							commandsReceived++;
-							LogMessage($"Command: {command.Command}");
-						});
-					}
-				}
-
-				// Keep the last incomplete line in the buffer
-				messageBuffer.Clear();
-				if (lines.Length > 0)
-				{
-					messageBuffer.Append(lines[lines.Length - 1]);
-				}
-			}
-			catch (Exception ex)
-			{
-				Invoke(() => LogMessage($"Error processing command data: {ex.Message}"));
-			}
-		}
-
-		private void WriteCommandToLog(CommandEntry command)
+		private void SaveCommandToLog(CommandEntry command)
 		{
 			try
 			{
@@ -624,7 +835,7 @@ namespace VideoStreamRecorder.Forms
 			}
 			catch (Exception ex)
 			{
-				Invoke(() => LogMessage($"Error writing command log: {ex.Message}"));
+				LogMessage($"Error saving command: {ex.Message}");
 			}
 		}
 
@@ -632,45 +843,22 @@ namespace VideoStreamRecorder.Forms
 
 		#region UI Management
 
-		private void ButtonBrowse_Click(object sender, EventArgs e)
+		private void ButtonBrowseOutput_Click(object sender, EventArgs e)
 		{
 			folderBrowserDialog.SelectedPath = textBoxOutputPath.Text;
 
 			if (folderBrowserDialog.ShowDialog() == DialogResult.OK)
 			{
 				textBoxOutputPath.Text = folderBrowserDialog.SelectedPath;
-				LogMessage($"Output directory changed to: {folderBrowserDialog.SelectedPath}");
+				LogMessage($"Output directory: {folderBrowserDialog.SelectedPath}");
 			}
 		}
 
-		private void ButtonOpenFolder_Click(object sender, EventArgs e)
-		{
-			try
-			{
-				if (Directory.Exists(textBoxOutputPath.Text))
-				{
-					Process.Start("explorer.exe", textBoxOutputPath.Text);
-					LogMessage($"Opened output folder: {textBoxOutputPath.Text}");
-				}
-				else
-				{
-					MessageBox.Show($"Directory does not exist: {textBoxOutputPath.Text}",
-						"Directory Not Found", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-				}
-			}
-			catch (Exception ex)
-			{
-				LogMessage($"Error opening folder: {ex.Message}");
-				MessageBox.Show($"Error opening folder: {ex.Message}", "Error",
-					MessageBoxButtons.OK, MessageBoxIcon.Error);
-			}
-		}
-
-		private void UpdateUIState()
+		private void UpdateUI()
 		{
 			if (InvokeRequired)
 			{
-				Invoke(UpdateUIState);
+				Invoke(UpdateUI);
 				return;
 			}
 
@@ -679,20 +867,24 @@ namespace VideoStreamRecorder.Forms
 			{
 				buttonConnect.Text = "Disconnect";
 				buttonConnect.BackColor = Color.LightCoral;
-				labelConnectionStatus.Text = "Status: Connected";
+				labelConnectionStatus.Text = "Connected to both streams";
 				labelConnectionStatus.ForeColor = Color.Green;
+				buttonStartRecording.Enabled = true;
 			}
 			else
 			{
 				buttonConnect.Text = "Connect";
-				buttonConnect.BackColor = Color.LightBlue;
-				labelConnectionStatus.Text = "Status: Disconnected";
+				buttonConnect.BackColor = Color.LightGreen;
+				labelConnectionStatus.Text = "Disconnected";
 				labelConnectionStatus.ForeColor = Color.Red;
+				buttonStartRecording.Enabled = false;
 			}
 
 			// Recording UI
-			buttonStartRecording.Enabled = isConnected && !isRecording;
 			buttonStopRecording.Enabled = isRecording;
+			groupBoxConnection.Enabled = !isRecording;
+			textBoxOutputPath.Enabled = !isRecording;
+			buttonBrowseOutput.Enabled = !isRecording;
 
 			if (isRecording)
 			{
@@ -704,13 +896,6 @@ namespace VideoStreamRecorder.Forms
 				labelRecordingStatus.Text = "Recording: Stopped";
 				labelRecordingStatus.ForeColor = Color.Red;
 			}
-
-			// Disable connection settings during recording
-			groupBoxConnection.Enabled = !isRecording;
-			textBoxOutputPath.Enabled = !isRecording;
-			buttonBrowse.Enabled = !isRecording;
-			checkBoxRecordVideo.Enabled = !isRecording;
-			checkBoxRecordCommands.Enabled = !isRecording;
 		}
 
 		private void UpdateStatusDisplay()
@@ -721,20 +906,64 @@ namespace VideoStreamRecorder.Forms
 				return;
 			}
 
-			// Update statistics
-			labelFramesReceived.Text = $"Frames Received: {framesReceived}";
-			labelCommandsReceived.Text = $"Commands Received: {commandsReceived}";
-			labelDataReceived.Text = $"Data Received: {totalDataReceived / (1024.0 * 1024.0):F2} MB";
+			labelFrameCount.Text = $"Frames: {frameCount}";
+			labelCommandCount.Text = $"Commands: {commandCount}";
 
-			// Update elapsed time
 			if (isRecording)
 			{
 				var elapsed = DateTime.Now - recordingStartTime;
-				labelElapsedTime.Text = $"Time: {elapsed:hh\\:mm\\:ss}";
+				labelRecordingTime.Text = $"Time: {elapsed:hh\\:mm\\:ss}";
 			}
 			else
 			{
-				labelElapsedTime.Text = "Time: 00:00:00";
+				labelRecordingTime.Text = "Time: 00:00:00";
+			}
+
+			// Update video status based on recent frames
+			if (DateTime.Now - lastFrameTime < TimeSpan.FromSeconds(2) && frameCount > 0)
+			{
+				labelVideoStatus.Text = $"Live video - {frameCount} frames";
+				labelVideoStatus.ForeColor = Color.Green;
+			}
+			else if (isConnected)
+			{
+				labelVideoStatus.Text = "Connected - No video frames";
+				labelVideoStatus.ForeColor = Color.Orange;
+			}
+			else
+			{
+				labelVideoStatus.Text = "No video signal";
+				labelVideoStatus.ForeColor = Color.Red;
+			}
+		}
+
+		private void UpdateVideoPreview(Mat frame)
+		{
+			try
+			{
+				if (InvokeRequired)
+				{
+					Invoke(() => UpdateVideoPreview(frame));
+					return;
+				}
+
+				if (frame == null || frame.Empty())
+				{
+					return;
+				}
+
+				// Convert OpenCV Mat to Bitmap for display
+				using var bitmap = BitmapConverter.ToBitmap(frame);
+
+				// Dispose previous image
+				pictureBoxVideo.Image?.Dispose();
+
+				// Set new image (create a copy since the bitmap will be disposed)
+				pictureBoxVideo.Image = new Bitmap(bitmap);
+			}
+			catch (Exception ex)
+			{
+				LogMessage($"Error updating preview: {ex.Message}");
 			}
 		}
 
@@ -746,30 +975,12 @@ namespace VideoStreamRecorder.Forms
 				return;
 			}
 
-			var timestamp = DateTime.Now.ToString("HH:mm:ss");
+			var timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
 			var logEntry = $"[{timestamp}] {message}";
 
 			textBoxLog.AppendText(logEntry + Environment.NewLine);
 			textBoxLog.SelectionStart = textBoxLog.Text.Length;
 			textBoxLog.ScrollToCaret();
-		}
-
-		private void CreateOutputDirectory()
-		{
-			try
-			{
-				if (!Directory.Exists(textBoxOutputPath.Text))
-				{
-					Directory.CreateDirectory(textBoxOutputPath.Text);
-					LogMessage($"Created output directory: {textBoxOutputPath.Text}");
-				}
-			}
-			catch (Exception ex)
-			{
-				LogMessage($"Error creating output directory: {ex.Message}");
-				MessageBox.Show($"Error creating output directory: {ex.Message}", "Directory Error",
-					MessageBoxButtons.OK, MessageBoxIcon.Warning);
-			}
 		}
 
 		#endregion
@@ -782,48 +993,30 @@ namespace VideoStreamRecorder.Forms
 			{
 				try
 				{
-					// Cancel any ongoing operations
-					cancellationTokenSource?.Cancel();
+					StopRecording();
+					DisconnectFromServer();
 
-					// Stop recording if active
-					if (isRecording)
-					{
-						isRecording = false;
-					}
-
-					// Safely dispose Accord VFW video writer
-					if (aviWriter != null)
-					{
-						try
-						{
-							aviWriter.Close();
-							aviWriter.Dispose();
-						}
-						catch { /* Ignore disposal errors */ }
-						aviWriter = null;
-					}
-
-					// Dispose frame buffer
-					frameBuffer?.Dispose();
-
-					// Dispose other resources
-					rawVideoStream?.Dispose();
+					currentFrame?.Dispose();
+					videoWriter?.Dispose();
 					commandLogWriter?.Dispose();
-					networkStream?.Dispose();
-					tcpClient?.Dispose();
+					videoStream?.Dispose();
+					videoClient?.Dispose();
+					commandStream?.Dispose();
+					commandClient?.Dispose();
 					cancellationTokenSource?.Dispose();
+					pictureBoxVideo.Image?.Dispose();
 					components?.Dispose();
 				}
 				catch (Exception ex)
 				{
-					// Log disposal errors but don't throw
+					// Log disposal error but don't throw
 					try
 					{
-						LogMessage($"Error during cleanup: {ex.Message}");
+						LogMessage($"Disposal error: {ex.Message}");
 					}
 					catch
 					{
-						// If logging fails, just ignore
+						// Ignore if logging fails during disposal
 					}
 				}
 			}
@@ -832,13 +1025,12 @@ namespace VideoStreamRecorder.Forms
 
 		#endregion
 	}
+}
 
-	// Helper classes for command logging
-	public class CommandEntry
-	{
-		public DateTime Timestamp { get; set; }
-		public string Command { get; set; } = string.Empty;
-		public string Source { get; set; } = string.Empty;
-		public TimeSpan RelativeTime { get; set; }
-	}
+// Command entry class for JSON serialization
+public class CommandEntry
+{
+	public DateTime Timestamp { get; set; }
+	public string Command { get; set; } = string.Empty;
+	public string Source { get; set; } = string.Empty;
 }
