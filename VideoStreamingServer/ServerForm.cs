@@ -41,6 +41,28 @@ namespace VideoStreamingServer
 		private const int VIDEO_PORT = 8080;
 		private const int COMMAND_PORT = 8081;
 
+		// Network simulation controls
+		private GroupBox networkSimulationGroup;
+		private CheckBox enableNetworkSimulationCheckBox;
+		private TrackBar latencyTrackBar;
+		private TrackBar packetLossTrackBar;
+		private TrackBar bandwidthTrackBar;
+		private CheckBox enableDropoutCheckBox;
+		private Label latencyLabel;
+		private Label packetLossLabel;
+		private Label bandwidthLabel;
+		private Label dropoutLabel;
+
+		// Network simulation state
+		private Random networkRandom = new Random();
+		private bool networkSimulationEnabled = false;
+		private int latencyMs = 0;
+		private int packetLossPercent = 0;
+		private int bandwidthLimitKbps = 0; // 0 = unlimited
+		private bool enableRandomDropouts = false;
+		private DateTime lastDropoutTime = DateTime.MinValue;
+		private int dropoutDurationMs = 0;
+
 		// AForge.NET objects (alternative to DirectShow)
 		private FilterInfoCollection videoDevices;
 		private VideoCaptureDevice videoSource;
@@ -65,11 +87,11 @@ namespace VideoStreamingServer
 
 		private void InitializeComponent()
 		{
-			this.Size = new Size(600, 500);
+			this.Size = new Size(700, 650);
 			this.Text = "Camera Video Streaming Server with Commands";
 			this.StartPosition = FormStartPosition.CenterScreen;
 			this.FormBorderStyle = FormBorderStyle.Sizable;
-			this.MinimumSize = new Size(600, 500);
+			this.MinimumSize = new Size(700, 650);
 
 			// Title label
 			Label titleLabel = new Label
@@ -77,7 +99,7 @@ namespace VideoStreamingServer
 				Text = "Camera Video Streaming Server",
 				Font = new Font("Arial", 14, FontStyle.Bold),
 				Location = new Point(50, 20),
-				Size = new Size(500, 25),
+				Size = new Size(600, 25),
 				TextAlign = ContentAlignment.MiddleCenter
 			};
 
@@ -161,19 +183,22 @@ namespace VideoStreamingServer
 				ForeColor = Color.Gray
 			};
 
+			// Network simulation group
+			CreateNetworkSimulationControls();
+
 			// Command log section
 			Label commandLogLabel = new Label
 			{
 				Text = "Command Log:",
-				Location = new Point(50, 245),
+				Location = new Point(50, 445),
 				Size = new Size(100, 20),
 				Font = new Font("Arial", 10, FontStyle.Bold)
 			};
 
 			commandLogTextBox = new RichTextBox
 			{
-				Location = new Point(50, 270),
-				Size = new Size(500, 180),
+				Location = new Point(50, 470),
+				Size = new Size(600, 130),
 				Font = new Font("Consolas", 9, FontStyle.Regular),
 				BackColor = Color.Black,
 				ForeColor = Color.LimeGreen,
@@ -185,8 +210,295 @@ namespace VideoStreamingServer
 			{
 				titleLabel, cameraLabel, cameraComboBox, startButton, stopButton,
 				statusLabel, clientCountLabel, commandStatusLabel,
-				videoPortLabel, commandPortLabel, commandLogLabel, commandLogTextBox
+				videoPortLabel, commandPortLabel, networkSimulationGroup,
+				commandLogLabel, commandLogTextBox
 			});
+		}
+
+		private void CreateNetworkSimulationControls()
+		{
+			networkSimulationGroup = new GroupBox
+			{
+				Text = "Network Simulation",
+				Location = new Point(50, 240),
+				Size = new Size(600, 200),
+				Font = new Font("Arial", 10, FontStyle.Bold)
+			};
+
+			enableNetworkSimulationCheckBox = new CheckBox
+			{
+				Text = "Enable Network Simulation",
+				Location = new Point(15, 25),
+				Size = new Size(200, 20),
+				Font = new Font("Arial", 9, FontStyle.Bold),
+				ForeColor = Color.DarkBlue
+			};
+			enableNetworkSimulationCheckBox.CheckedChanged += EnableNetworkSimulation_CheckedChanged;
+
+			// Latency controls
+			Label latencyTitleLabel = new Label
+			{
+				Text = "Latency (ms):",
+				Location = new Point(15, 55),
+				Size = new Size(80, 20),
+				Font = new Font("Arial", 9, FontStyle.Regular)
+			};
+
+			latencyTrackBar = new TrackBar
+			{
+				Location = new Point(100, 50),
+				Size = new Size(150, 45),
+				Minimum = 0,
+				Maximum = 2000,
+				Value = 0,
+				TickFrequency = 200
+			};
+			latencyTrackBar.ValueChanged += LatencyTrackBar_ValueChanged;
+
+			latencyLabel = new Label
+			{
+				Text = "0 ms",
+				Location = new Point(260, 55),
+				Size = new Size(60, 20),
+				Font = new Font("Arial", 9, FontStyle.Regular),
+				ForeColor = Color.Blue
+			};
+
+			// Packet loss controls
+			Label packetLossTitleLabel = new Label
+			{
+				Text = "Packet Loss (%):",
+				Location = new Point(15, 100),
+				Size = new Size(100, 20),
+				Font = new Font("Arial", 9, FontStyle.Regular)
+			};
+
+			packetLossTrackBar = new TrackBar
+			{
+				Location = new Point(120, 95),
+				Size = new Size(130, 45),
+				Minimum = 0,
+				Maximum = 50,
+				Value = 0,
+				TickFrequency = 5
+			};
+			packetLossTrackBar.ValueChanged += PacketLossTrackBar_ValueChanged;
+
+			packetLossLabel = new Label
+			{
+				Text = "0%",
+				Location = new Point(260, 100),
+				Size = new Size(60, 20),
+				Font = new Font("Arial", 9, FontStyle.Regular),
+				ForeColor = Color.Red
+			};
+
+			// Bandwidth controls
+			Label bandwidthTitleLabel = new Label
+			{
+				Text = "Bandwidth Limit:",
+				Location = new Point(350, 55),
+				Size = new Size(100, 20),
+				Font = new Font("Arial", 9, FontStyle.Regular)
+			};
+
+			bandwidthTrackBar = new TrackBar
+			{
+				Location = new Point(460, 50),
+				Size = new Size(120, 45),
+				Minimum = 0,
+				Maximum = 1000,
+				Value = 0,
+				TickFrequency = 100
+			};
+			bandwidthTrackBar.ValueChanged += BandwidthTrackBar_ValueChanged;
+
+			bandwidthLabel = new Label
+			{
+				Text = "Unlimited",
+				Location = new Point(460, 95),
+				Size = new Size(120, 20),
+				Font = new Font("Arial", 9, FontStyle.Regular),
+				ForeColor = Color.Orange,
+				TextAlign = ContentAlignment.MiddleCenter
+			};
+
+			// Connection dropout controls
+			enableDropoutCheckBox = new CheckBox
+			{
+				Text = "Random Connection Dropouts",
+				Location = new Point(350, 120),
+				Size = new Size(200, 20),
+				Font = new Font("Arial", 9, FontStyle.Regular),
+				ForeColor = Color.DarkRed
+			};
+			enableDropoutCheckBox.CheckedChanged += EnableDropout_CheckedChanged;
+
+			dropoutLabel = new Label
+			{
+				Text = "Simulates random 1-3s disconnections",
+				Location = new Point(350, 145),
+				Size = new Size(220, 20),
+				Font = new Font("Arial", 8, FontStyle.Italic),
+				ForeColor = Color.Gray
+			};
+
+			// Reset button
+			Button resetSimulationButton = new Button
+			{
+				Text = "Reset to Normal",
+				Location = new Point(15, 160),
+				Size = new Size(120, 25),
+				Font = new Font("Arial", 9, FontStyle.Regular),
+				BackColor = Color.LightBlue
+			};
+			resetSimulationButton.Click += ResetSimulation_Click;
+
+			networkSimulationGroup.Controls.AddRange(new Control[]
+			{
+				enableNetworkSimulationCheckBox, latencyTitleLabel, latencyTrackBar, latencyLabel,
+				packetLossTitleLabel, packetLossTrackBar, packetLossLabel,
+				bandwidthTitleLabel, bandwidthTrackBar, bandwidthLabel,
+				enableDropoutCheckBox, dropoutLabel, resetSimulationButton
+			});
+		}
+
+		private void EnableNetworkSimulation_CheckedChanged(object sender, EventArgs e)
+		{
+			networkSimulationEnabled = enableNetworkSimulationCheckBox.Checked;
+
+			// Enable/disable all simulation controls
+			latencyTrackBar.Enabled = networkSimulationEnabled;
+			packetLossTrackBar.Enabled = networkSimulationEnabled;
+			bandwidthTrackBar.Enabled = networkSimulationEnabled;
+			enableDropoutCheckBox.Enabled = networkSimulationEnabled;
+
+			if (networkSimulationEnabled)
+			{
+				LogCommand("SIMULATION", "Network simulation ENABLED");
+				UpdateSimulationValues();
+			}
+			else
+			{
+				LogCommand("SIMULATION", "Network simulation DISABLED");
+			}
+		}
+
+		private void LatencyTrackBar_ValueChanged(object sender, EventArgs e)
+		{
+			latencyMs = latencyTrackBar.Value;
+			latencyLabel.Text = $"{latencyMs} ms";
+			latencyLabel.ForeColor = latencyMs > 500 ? Color.Red : (latencyMs > 100 ? Color.Orange : Color.Blue);
+		}
+
+		private void PacketLossTrackBar_ValueChanged(object sender, EventArgs e)
+		{
+			packetLossPercent = packetLossTrackBar.Value;
+			packetLossLabel.Text = $"{packetLossPercent}%";
+			packetLossLabel.ForeColor = packetLossPercent > 10 ? Color.Red : (packetLossPercent > 2 ? Color.Orange : Color.Green);
+		}
+
+		private void BandwidthTrackBar_ValueChanged(object sender, EventArgs e)
+		{
+			bandwidthLimitKbps = bandwidthTrackBar.Value;
+			if (bandwidthLimitKbps == 0)
+			{
+				bandwidthLabel.Text = "Unlimited";
+				bandwidthLabel.ForeColor = Color.Green;
+			}
+			else
+			{
+				bandwidthLabel.Text = $"{bandwidthLimitKbps} Kbps";
+				bandwidthLabel.ForeColor = bandwidthLimitKbps < 100 ? Color.Red : (bandwidthLimitKbps < 500 ? Color.Orange : Color.Blue);
+			}
+		}
+
+		private void EnableDropout_CheckedChanged(object sender, EventArgs e)
+		{
+			enableRandomDropouts = enableDropoutCheckBox.Checked;
+			LogCommand("SIMULATION", $"Random dropouts {(enableRandomDropouts ? "ENABLED" : "DISABLED")}");
+		}
+
+		private void ResetSimulation_Click(object sender, EventArgs e)
+		{
+			enableNetworkSimulationCheckBox.Checked = false;
+			latencyTrackBar.Value = 0;
+			packetLossTrackBar.Value = 0;
+			bandwidthTrackBar.Value = 0;
+			enableDropoutCheckBox.Checked = false;
+
+			LogCommand("SIMULATION", "Network simulation reset to normal conditions");
+		}
+
+		private void UpdateSimulationValues()
+		{
+			if (networkSimulationEnabled)
+			{
+				LogCommand("SIMULATION", $"Latency: {latencyMs}ms, Packet Loss: {packetLossPercent}%, " +
+					$"Bandwidth: {(bandwidthLimitKbps == 0 ? "Unlimited" : bandwidthLimitKbps + " Kbps")}, " +
+					$"Dropouts: {(enableRandomDropouts ? "Enabled" : "Disabled")}");
+			}
+		}
+
+		private async Task<bool> SimulateNetworkConditions(byte[] data)
+		{
+			if (!networkSimulationEnabled)
+				return true;
+
+			// Simulate packet loss
+			if (packetLossPercent > 0 && networkRandom.Next(100) < packetLossPercent)
+			{
+				return false; // Drop this packet
+			}
+
+			// Simulate random dropouts
+			if (enableRandomDropouts)
+			{
+				DateTime now = DateTime.Now;
+
+				// Check if we're in a dropout period
+				if (dropoutDurationMs > 0 && (now - lastDropoutTime).TotalMilliseconds < dropoutDurationMs)
+				{
+					return false; // Still in dropout
+				}
+
+				// Random chance to start a new dropout (1% chance per call)
+				if (dropoutDurationMs == 0 && networkRandom.Next(1000) < 10)
+				{
+					dropoutDurationMs = networkRandom.Next(1000, 3000); // 1-3 second dropout
+					lastDropoutTime = now;
+					LogCommand("SIMULATION", $"Connection dropout started ({dropoutDurationMs}ms)");
+					return false;
+				}
+
+				// End dropout if duration has passed
+				if (dropoutDurationMs > 0 && (now - lastDropoutTime).TotalMilliseconds >= dropoutDurationMs)
+				{
+					LogCommand("SIMULATION", "Connection dropout ended");
+					dropoutDurationMs = 0;
+				}
+			}
+
+			// Simulate latency
+			if (latencyMs > 0)
+			{
+				await Task.Delay(latencyMs);
+			}
+
+			// Simulate bandwidth limitation
+			if (bandwidthLimitKbps > 0)
+			{
+				// Calculate delay based on data size and bandwidth limit
+				double bytesPerMs = (bandwidthLimitKbps * 1024.0) / (8.0 * 1000.0); // Convert Kbps to bytes per ms
+				double transmitTimeMs = data.Length / bytesPerMs;
+
+				if (transmitTimeMs > 1)
+				{
+					await Task.Delay((int)transmitTimeMs);
+				}
+			}
+
+			return true; // Packet delivered successfully
 		}
 
 		private void LoadCameraDevices()
@@ -266,6 +578,10 @@ namespace VideoStreamingServer
 				statusLabel.ForeColor = Color.Green;
 
 				LogCommand("SERVER", "Server started successfully");
+				if (networkSimulationEnabled)
+				{
+					UpdateSimulationValues();
+				}
 			}
 			catch (Exception ex)
 			{
@@ -424,6 +740,12 @@ namespace VideoStreamingServer
 
 								// Process any pending commands that affect the video
 								ProcessPendingCommands(g, newWidth, newHeight);
+
+								// Draw network simulation indicators
+								if (networkSimulationEnabled)
+								{
+									DrawNetworkSimulationIndicators(g, newWidth, newHeight);
+								}
 							}
 
 							// Convert to JPEG byte array
@@ -442,6 +764,63 @@ namespace VideoStreamingServer
 					hasNewFrame = false;
 					currentFrame = null;
 				}
+			}
+		}
+
+		private void DrawNetworkSimulationIndicators(Graphics g, int width, int height)
+		{
+			try
+			{
+				// Draw simulation status indicator
+				using (SolidBrush backgroundBrush = new SolidBrush(Color.FromArgb(150, Color.DarkBlue)))
+				{
+					Rectangle indicatorRect = new Rectangle(width - 200, height - 80, 190, 70);
+					g.FillRectangle(backgroundBrush, indicatorRect);
+
+					using (Pen borderPen = new Pen(Color.Yellow, 2))
+					{
+						g.DrawRectangle(borderPen, indicatorRect);
+					}
+				}
+
+				using (Font indicatorFont = new Font("Arial", 8, FontStyle.Bold))
+				using (SolidBrush textBrush = new SolidBrush(Color.White))
+				{
+					g.DrawString("NET SIM", indicatorFont, textBrush, width - 195, height - 75);
+					g.DrawString($"Lat: {latencyMs}ms", new Font("Arial", 7), textBrush, width - 195, height - 60);
+					g.DrawString($"Loss: {packetLossPercent}%", new Font("Arial", 7), textBrush, width - 195, height - 45);
+
+					string bwText = bandwidthLimitKbps == 0 ? "BW: ?" : $"BW: {bandwidthLimitKbps}K";
+					g.DrawString(bwText, new Font("Arial", 7), textBrush, width - 195, height - 30);
+
+					if (enableRandomDropouts)
+					{
+						g.DrawString("DROPOUTS", new Font("Arial", 7, FontStyle.Bold),
+							new SolidBrush(Color.Red), width - 195, height - 15);
+					}
+				}
+
+				// Show active dropout indicator
+				if (dropoutDurationMs > 0 && (DateTime.Now - lastDropoutTime).TotalMilliseconds < dropoutDurationMs)
+				{
+					using (SolidBrush dropoutBrush = new SolidBrush(Color.FromArgb(200, Color.Red)))
+					{
+						g.FillRectangle(dropoutBrush, 0, 0, width, height);
+					}
+
+					using (Font dropoutFont = new Font("Arial", 24, FontStyle.Bold))
+					using (SolidBrush dropoutTextBrush = new SolidBrush(Color.White))
+					{
+						string dropoutText = "CONNECTION DROPOUT";
+						SizeF textSize = g.MeasureString(dropoutText, dropoutFont);
+						g.DrawString(dropoutText, dropoutFont, dropoutTextBrush,
+							(width - textSize.Width) / 2, (height - textSize.Height) / 2);
+					}
+				}
+			}
+			catch (Exception ex)
+			{
+				Console.WriteLine($"Error drawing network simulation indicators: {ex.Message}");
 			}
 		}
 
@@ -531,12 +910,81 @@ namespace VideoStreamingServer
 						case "togglepause":
 							HandleTogglePause(commandObj);
 							break;
+						case "chat":
+							HandleChatCommand(g, commandObj, width, height);
+							break;
 					}
 				}
 			}
 			catch (Exception ex)
 			{
 				LogCommand("ERROR", $"Failed to execute command: {ex.Message}");
+			}
+		}
+
+		private void HandleChatCommand(Graphics g, Dictionary<string, object> command, int width, int height)
+		{
+			try
+			{
+				string message = GetValueOrDefault(command, "message", "").ToString();
+				string sender = GetValueOrDefault(command, "sender", "Unknown").ToString();
+				string timestamp = GetValueOrDefault(command, "timestamp", DateTime.Now.ToString()).ToString();
+
+				LogCommand("CHAT", $"{sender}: {message}");
+
+				// Draw chat message on video frame
+				DrawChatOverlay(g, $"{sender}: {message}", width, height);
+			}
+			catch (Exception ex)
+			{
+				LogCommand("ERROR", $"HandleChatCommand error: {ex.Message}");
+			}
+		}
+
+		private void DrawChatOverlay(Graphics g, string chatMessage, int width, int height)
+		{
+			try
+			{
+				// Truncate long messages
+				string displayMessage = chatMessage;
+				if (displayMessage.Length > 60)
+				{
+					displayMessage = displayMessage.Substring(0, 57) + "...";
+				}
+
+				// Draw semi-transparent background
+				using (Font chatFont = new Font("Arial", 12, FontStyle.Bold))
+				{
+					SizeF textSize = g.MeasureString(displayMessage, chatFont);
+					RectangleF backgroundRect = new RectangleF(
+						10, 10,
+						Math.Min(textSize.Width + 20, width - 20),
+						textSize.Height + 10
+					);
+
+					using (SolidBrush backgroundBrush = new SolidBrush(Color.FromArgb(180, Color.Black)))
+					{
+						g.FillRectangle(backgroundBrush, backgroundRect);
+					}
+
+					// Draw "CHAT:" label
+					using (SolidBrush labelBrush = new SolidBrush(Color.Yellow))
+					{
+						g.DrawString("CHAT:", chatFont, labelBrush, 15, 15);
+					}
+
+					// Draw chat message
+					using (SolidBrush textBrush = new SolidBrush(Color.White))
+					{
+						SizeF labelSize = g.MeasureString("CHAT:", chatFont);
+						g.DrawString(displayMessage, new Font("Arial", 10, FontStyle.Regular),
+							textBrush, 15 + labelSize.Width + 5, 17);
+					}
+				}
+			}
+			catch (Exception ex)
+			{
+				LogCommand("ERROR", $"Error drawing chat overlay: {ex.Message}");
 			}
 		}
 
@@ -685,7 +1133,7 @@ namespace VideoStreamingServer
 					TcpClient client = tcpListener.AcceptTcpClient();
 
 					// Handle each client in a separate thread
-					Thread clientThread = new Thread(() => HandleVideoClient(client));
+					Thread clientThread = new Thread(async () => await HandleVideoClient(client));
 					clientThread.IsBackground = true;
 					clientThread.Start();
 				}
@@ -740,7 +1188,7 @@ namespace VideoStreamingServer
 			}
 		}
 
-		private void HandleVideoClient(TcpClient client)
+		private async Task HandleVideoClient(TcpClient client)
 		{
 			try
 			{
@@ -748,7 +1196,7 @@ namespace VideoStreamingServer
 				this.Invoke(new Action(() => UpdateClientCounts()));
 
 				LogCommand("VIDEO", $"Video client connected from {client.Client.RemoteEndPoint}");
-				StreamToClient(client);
+				await StreamToClient(client);
 			}
 			finally
 			{
@@ -827,8 +1275,8 @@ namespace VideoStreamingServer
 									pendingCommands.Enqueue(trimmedCommand);
 								}
 
-								// Echo the command back to ALL command clients
-								EchoCommandToClients(trimmedCommand, client);
+								// Echo the command back to ALL command clients (with network simulation)
+								_ = Task.Run(async () => await EchoCommandToClientsAsync(trimmedCommand, client));
 
 								LogCommand("RECEIVED", trimmedCommand);
 							}
@@ -847,7 +1295,7 @@ namespace VideoStreamingServer
 			}
 		}
 
-		private void EchoCommandToClients(string command, TcpClient sendingClient)
+		private async Task EchoCommandToClientsAsync(string command, TcpClient sendingClient)
 		{
 			// Create echo response with timestamp and sender info
 			var echoResponse = new
@@ -861,6 +1309,13 @@ namespace VideoStreamingServer
 
 			string echoJson = JsonConvert.SerializeObject(echoResponse) + "\n";
 			byte[] echoData = Encoding.UTF8.GetBytes(echoJson);
+
+			// Apply network simulation to command echo
+			if (!await SimulateNetworkConditions(echoData))
+			{
+				LogCommand("SIMULATION", "Command echo dropped due to network simulation");
+				return;
+			}
 
 			lock (commandClientsLock)
 			{
@@ -943,7 +1398,7 @@ namespace VideoStreamingServer
 			}
 		}
 
-		private void StreamToClient(TcpClient client)
+		private async Task StreamToClient(TcpClient client)
 		{
 			NetworkStream stream = client.GetStream();
 			byte[] lastSentFrame = null;
@@ -981,17 +1436,33 @@ namespace VideoStreamingServer
 
 					if (frameData != null)
 					{
-						// Send frame size first (4 bytes)
-						byte[] sizeBytes = BitConverter.GetBytes(frameData.Length);
-						stream.Write(sizeBytes, 0, 4);
+						// Apply network simulation to video frames
+						if (await SimulateNetworkConditions(frameData))
+						{
+							// Send frame size first (4 bytes)
+							byte[] sizeBytes = BitConverter.GetBytes(frameData.Length);
 
-						// Send frame data
-						stream.Write(frameData, 0, frameData.Length);
-						stream.Flush();
+							// Apply simulation to size header too
+							if (await SimulateNetworkConditions(sizeBytes))
+							{
+								stream.Write(sizeBytes, 0, 4);
+								stream.Write(frameData, 0, frameData.Length);
+								stream.Flush();
+							}
+						}
+						// If simulation drops the packet, we just skip sending this frame
 					}
 
-					// Control frame rate (15 FPS)
-					Thread.Sleep(67);
+					// Control frame rate (15 FPS) - but add jitter if network simulation is enabled
+					int baseDelay = 67;
+					if (networkSimulationEnabled && latencyMs > 0)
+					{
+						// Add random jitter (±20ms)
+						int jitter = networkRandom.Next(-20, 21);
+						baseDelay += jitter;
+					}
+
+					await Task.Delay(Math.Max(10, baseDelay));
 				}
 				catch (Exception ex)
 				{
