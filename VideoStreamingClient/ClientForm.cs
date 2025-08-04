@@ -23,26 +23,22 @@ namespace VideoStreamingClient
 		private bool isPaused = false;
 
 		private TextBox serverIpTextBox;
+		private NumericUpDown videoPortNumeric;
+		private NumericUpDown commandPortNumeric;
 		private Button connectButton;
 		private Button disconnectButton;
-		private Button connectCommandButton;
-		private Button disconnectCommandButton;
 		private Button togglePauseButton;
 		private PictureBox videoPictureBox;
 		private Label statusLabel;
-		private Label commandStatusLabel;
 		private Label fpsLabel;
 		private Label chatDisplayLabel;
 		private Panel controlPanel;
-		private Panel commandPanel;
 		private Panel chatPanel;
 		private TextBox chatTextBox;
 		private Button sendChatButton;
 
 		private int frameCount = 0;
 		private DateTime lastFpsUpdate = DateTime.Now;
-		private const int VIDEO_PORT = 8080;
-		private const int COMMAND_PORT = 8081;
 		private string lastChatMessage = "";
 		private DateTime lastChatTime = DateTime.MinValue;
 
@@ -53,16 +49,16 @@ namespace VideoStreamingClient
 
 		private void InitializeComponent()
 		{
-			this.Size = new Size(900, 750);
+			this.Size = new Size(900, 650);
 			this.Text = "Video Streaming Client with Commands";
 			this.StartPosition = FormStartPosition.CenterScreen;
 			this.MinimumSize = new Size(600, 500);
 
-			// Video control panel at the top
+			// Main control panel at the top
 			controlPanel = new Panel
 			{
 				Location = new Point(0, 0),
-				Size = new Size(900, 60),
+				Size = new Size(900, 80),
 				BackColor = Color.LightGray,
 				Dock = DockStyle.Top
 			};
@@ -71,7 +67,7 @@ namespace VideoStreamingClient
 			Label ipLabel = new Label
 			{
 				Text = "Server IP:",
-				Location = new Point(10, 20),
+				Location = new Point(10, 15),
 				Size = new Size(60, 20),
 				Font = new Font("Arial", 9, FontStyle.Regular)
 			};
@@ -79,36 +75,85 @@ namespace VideoStreamingClient
 			serverIpTextBox = new TextBox
 			{
 				Text = "127.0.0.1",
-				Location = new Point(80, 17),
+				Location = new Point(80, 12),
 				Size = new Size(120, 23),
 				Font = new Font("Arial", 9, FontStyle.Regular)
 			};
 
+			// Video port input
+			Label videoPortLabel = new Label
+			{
+				Text = "Video Port:",
+				Location = new Point(10, 45),
+				Size = new Size(65, 20),
+				Font = new Font("Arial", 9, FontStyle.Regular)
+			};
+
+			videoPortNumeric = new NumericUpDown
+			{
+				Location = new Point(80, 42),
+				Size = new Size(80, 23),
+				Font = new Font("Arial", 9, FontStyle.Regular),
+				Minimum = 1,
+				Maximum = 65535,
+				Value = 8080
+			};
+
+			// Command port input
+			Label commandPortLabel = new Label
+			{
+				Text = "Cmd Port:",
+				Location = new Point(170, 45),
+				Size = new Size(60, 20),
+				Font = new Font("Arial", 9, FontStyle.Regular)
+			};
+
+			commandPortNumeric = new NumericUpDown
+			{
+				Location = new Point(235, 42),
+				Size = new Size(80, 23),
+				Font = new Font("Arial", 9, FontStyle.Regular),
+				Minimum = 1,
+				Maximum = 65535,
+				Value = 8081
+			};
+
 			connectButton = new Button
 			{
-				Text = "Connect Video",
-				Location = new Point(220, 15),
+				Text = "Connect",
+				Location = new Point(330, 15),
 				Size = new Size(100, 27),
-				Font = new Font("Arial", 9, FontStyle.Regular),
+				Font = new Font("Arial", 9, FontStyle.Bold),
 				BackColor = Color.LightGreen
 			};
 			connectButton.Click += Connect_Click;
 
 			disconnectButton = new Button
 			{
-				Text = "Disconnect Video",
-				Location = new Point(340, 15),
-				Size = new Size(110, 27),
-				Font = new Font("Arial", 9, FontStyle.Regular),
+				Text = "Disconnect",
+				Location = new Point(330, 45),
+				Size = new Size(100, 27),
+				Font = new Font("Arial", 9, FontStyle.Bold),
 				BackColor = Color.LightCoral,
 				Enabled = false
 			};
 			disconnectButton.Click += Disconnect_Click;
 
+			togglePauseButton = new Button
+			{
+				Text = "Toggle Pause",
+				Location = new Point(450, 30),
+				Size = new Size(100, 27),
+				Font = new Font("Arial", 9, FontStyle.Bold),
+				BackColor = Color.Orange,
+				Enabled = false
+			};
+			togglePauseButton.Click += TogglePause_Click;
+
 			statusLabel = new Label
 			{
-				Text = "Video: Disconnected",
-				Location = new Point(470, 20),
+				Text = "Disconnected",
+				Location = new Point(570, 20),
 				Size = new Size(150, 20),
 				Font = new Font("Arial", 9, FontStyle.Regular),
 				ForeColor = Color.Red
@@ -117,7 +162,7 @@ namespace VideoStreamingClient
 			fpsLabel = new Label
 			{
 				Text = "FPS: 0",
-				Location = new Point(630, 20),
+				Location = new Point(570, 45),
 				Size = new Size(80, 20),
 				Font = new Font("Arial", 9, FontStyle.Regular),
 				ForeColor = Color.Blue
@@ -125,70 +170,15 @@ namespace VideoStreamingClient
 
 			controlPanel.Controls.AddRange(new Control[]
 			{
-				ipLabel, serverIpTextBox, connectButton,
-				disconnectButton, statusLabel, fpsLabel
-			});
-
-			// Command control panel
-			commandPanel = new Panel
-			{
-				Location = new Point(0, 60),
-				Size = new Size(900, 50),
-				BackColor = Color.LightBlue,
-				Dock = DockStyle.Top
-			};
-
-			connectCommandButton = new Button
-			{
-				Text = "Connect Commands",
-				Location = new Point(20, 12),
-				Size = new Size(120, 27),
-				Font = new Font("Arial", 9, FontStyle.Regular),
-				BackColor = Color.LightGreen
-			};
-			connectCommandButton.Click += ConnectCommand_Click;
-
-			disconnectCommandButton = new Button
-			{
-				Text = "Disconnect Commands",
-				Location = new Point(160, 12),
-				Size = new Size(130, 27),
-				Font = new Font("Arial", 9, FontStyle.Regular),
-				BackColor = Color.LightCoral,
-				Enabled = false
-			};
-			disconnectCommandButton.Click += DisconnectCommand_Click;
-
-			togglePauseButton = new Button
-			{
-				Text = "Toggle Pause",
-				Location = new Point(310, 12),
-				Size = new Size(100, 27),
-				Font = new Font("Arial", 9, FontStyle.Bold),
-				BackColor = Color.Orange,
-				Enabled = false
-			};
-			togglePauseButton.Click += TogglePause_Click;
-
-			commandStatusLabel = new Label
-			{
-				Text = "Commands: Disconnected",
-				Location = new Point(430, 17),
-				Size = new Size(200, 20),
-				Font = new Font("Arial", 9, FontStyle.Regular),
-				ForeColor = Color.Red
-			};
-
-			commandPanel.Controls.AddRange(new Control[]
-			{
-				connectCommandButton, disconnectCommandButton,
-				togglePauseButton, commandStatusLabel
+				ipLabel, serverIpTextBox, videoPortLabel, videoPortNumeric,
+				commandPortLabel, commandPortNumeric, connectButton,
+				disconnectButton, togglePauseButton, statusLabel, fpsLabel
 			});
 
 			// Chat panel
 			chatPanel = new Panel
 			{
-				Location = new Point(0, 110),
+				Location = new Point(0, 80),
 				Size = new Size(900, 40),
 				BackColor = Color.LightYellow,
 				Dock = DockStyle.Top
@@ -258,7 +248,7 @@ namespace VideoStreamingClient
 			};
 			videoPictureBox.Controls.Add(placeholderLabel);
 
-			this.Controls.AddRange(new Control[] { controlPanel, commandPanel, chatPanel, videoPictureBox });
+			this.Controls.AddRange(new Control[] { controlPanel, chatPanel, videoPictureBox });
 		}
 
 		private void ChatTextBox_KeyPress(object sender, KeyPressEventArgs e)
@@ -328,9 +318,13 @@ namespace VideoStreamingClient
 				connectButton.Enabled = false;
 				Application.DoEvents();
 
+				string serverIP = serverIpTextBox.Text;
+				int videoPort = (int)videoPortNumeric.Value;
+				int commandPort = (int)commandPortNumeric.Value;
+
 				// Connect to video stream
 				tcpClient = new TcpClient();
-				tcpClient.Connect(serverIpTextBox.Text, VIDEO_PORT);
+				tcpClient.Connect(serverIP, videoPort);
 				stream = tcpClient.GetStream();
 
 				isConnected = true;
@@ -340,7 +334,7 @@ namespace VideoStreamingClient
 
 				// Connect to command stream
 				commandClient = new TcpClient();
-				commandClient.Connect(serverIpTextBox.Text, COMMAND_PORT);
+				commandClient.Connect(serverIP, commandPort);
 				commandStream = commandClient.GetStream();
 
 				isCommandConnected = true;
@@ -349,12 +343,15 @@ namespace VideoStreamingClient
 				commandReceiveThread.Start();
 
 				// Update UI for successful connection
+				connectButton.Enabled = false;
 				disconnectButton.Enabled = true;
 				togglePauseButton.Enabled = true;
 				chatTextBox.Enabled = true;
 				sendChatButton.Enabled = true;
 				serverIpTextBox.Enabled = false;
-				statusLabel.Text = "Connected (Video + Commands)";
+				videoPortNumeric.Enabled = false;
+				commandPortNumeric.Enabled = false;
+				statusLabel.Text = $"Connected (V:{videoPort} C:{commandPort})";
 				statusLabel.ForeColor = Color.Green;
 
 				// Clear placeholder
@@ -363,8 +360,7 @@ namespace VideoStreamingClient
 			catch (Exception ex)
 			{
 				// Clean up on connection failure
-				DisconnectFromVideoServer();
-				DisconnectFromCommandServer();
+				DisconnectAll();
 
 				statusLabel.Text = "Connection failed";
 				statusLabel.ForeColor = Color.Red;
@@ -376,56 +372,73 @@ namespace VideoStreamingClient
 
 		private void Disconnect_Click(object sender, EventArgs e)
 		{
-			DisconnectFromVideoServer();
-			DisconnectFromCommandServer();
+			DisconnectAll();
 		}
 
-		private void ConnectCommand_Click(object sender, EventArgs e)
+		private void DisconnectAll()
 		{
-			if (string.IsNullOrWhiteSpace(serverIpTextBox.Text))
-			{
-				MessageBox.Show("Please enter a server IP address.", "Invalid Input",
-					MessageBoxButtons.OK, MessageBoxIcon.Warning);
-				return;
-			}
-
+			// Disconnect video
+			isConnected = false;
 			try
 			{
-				commandStatusLabel.Text = "Commands: Connecting...";
-				commandStatusLabel.ForeColor = Color.Orange;
-				Application.DoEvents();
-
-				commandClient = new TcpClient();
-				commandClient.Connect(serverIpTextBox.Text, COMMAND_PORT);
-				commandStream = commandClient.GetStream();
-
-				isCommandConnected = true;
-
-				// Start command receive thread to listen for echoes
-				commandReceiveThread = new Thread(ReceiveCommands);
-				commandReceiveThread.IsBackground = true;
-				commandReceiveThread.Start();
-
-				connectCommandButton.Enabled = false;
-				disconnectCommandButton.Enabled = true;
-				togglePauseButton.Enabled = true;
-				chatTextBox.Enabled = true;
-				sendChatButton.Enabled = true;
-				commandStatusLabel.Text = "Commands: Connected";
-				commandStatusLabel.ForeColor = Color.Green;
+				stream?.Close();
+				tcpClient?.Close();
 			}
-			catch (Exception ex)
+			catch { }
+
+			if (receiveThread != null && receiveThread.IsAlive)
 			{
-				commandStatusLabel.Text = "Commands: Connection failed";
-				commandStatusLabel.ForeColor = Color.Red;
-				MessageBox.Show($"Command connection failed: {ex.Message}", "Connection Error",
-					MessageBoxButtons.OK, MessageBoxIcon.Error);
+				receiveThread.Join(2000);
 			}
-		}
 
-		private void DisconnectCommand_Click(object sender, EventArgs e)
-		{
-			DisconnectFromCommandServer();
+			// Disconnect commands
+			isCommandConnected = false;
+			try
+			{
+				commandStream?.Close();
+				commandClient?.Close();
+			}
+			catch { }
+
+			if (commandReceiveThread != null && commandReceiveThread.IsAlive)
+			{
+				commandReceiveThread.Join(2000);
+			}
+
+			// Update UI state
+			connectButton.Enabled = true;
+			disconnectButton.Enabled = false;
+			togglePauseButton.Enabled = false;
+			togglePauseButton.Text = "Toggle Pause";
+			togglePauseButton.BackColor = Color.Orange;
+			chatTextBox.Enabled = false;
+			sendChatButton.Enabled = false;
+			serverIpTextBox.Enabled = true;
+			statusLabel.Text = "Disconnected";
+			statusLabel.ForeColor = Color.Red;
+			fpsLabel.Text = "FPS: 0";
+
+			// Clear video display and show placeholder
+			if (videoPictureBox.Image != null)
+			{
+				videoPictureBox.Image.Dispose();
+				videoPictureBox.Image = null;
+			}
+
+			Label placeholderLabel = new Label
+			{
+				Text = "Video will appear here when connected",
+				ForeColor = Color.White,
+				BackColor = Color.Transparent,
+				Font = new Font("Arial", 12, FontStyle.Italic),
+				TextAlign = ContentAlignment.MiddleCenter,
+				Dock = DockStyle.Fill
+			};
+			videoPictureBox.Controls.Clear();
+			videoPictureBox.Controls.Add(placeholderLabel);
+
+			isPaused = false;
+			this.Text = "Video Streaming Client with Commands";
 		}
 
 		private void ReceiveCommands()
@@ -506,8 +519,6 @@ namespace VideoStreamingClient
 									originalCommandObj["message"].ToString() : "";
 								string sender = originalCommandObj.ContainsKey("sender") ?
 									originalCommandObj["sender"].ToString() : "Unknown";
-								string timestamp = originalCommandObj.ContainsKey("timestamp") ?
-									originalCommandObj["timestamp"].ToString() : DateTime.Now.ToString();
 
 								this.Invoke(new Action(() =>
 								{
@@ -566,118 +577,6 @@ namespace VideoStreamingClient
 				MessageBox.Show($"Failed to send command: {ex.Message}", "Command Error",
 					MessageBoxButtons.OK, MessageBoxIcon.Error);
 			}
-		}
-
-		private void SendDrawCommand(string type, object parameters)
-		{
-			if (!isCommandConnected)
-			{
-				MessageBox.Show("Please connect to command stream first.", "Not Connected",
-					MessageBoxButtons.OK, MessageBoxIcon.Warning);
-				return;
-			}
-
-			try
-			{
-				// Create drawing command
-				var command = new
-				{
-					type = type,
-					timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
-					clientId = Environment.MachineName
-				};
-
-				// Merge with parameters
-				var commandDict = JsonConvert.DeserializeObject<Dictionary<string, object>>(
-					JsonConvert.SerializeObject(command));
-				var paramDict = JsonConvert.DeserializeObject<Dictionary<string, object>>(
-					JsonConvert.SerializeObject(parameters));
-
-				foreach (var kvp in paramDict)
-				{
-					commandDict[kvp.Key] = kvp.Value;
-				}
-
-				string jsonCommand = JsonConvert.SerializeObject(commandDict) + "\n";
-				byte[] commandBytes = Encoding.UTF8.GetBytes(jsonCommand);
-
-				commandStream.Write(commandBytes, 0, commandBytes.Length);
-				commandStream.Flush();
-			}
-			catch (Exception ex)
-			{
-				MessageBox.Show($"Failed to send draw command: {ex.Message}", "Command Error",
-					MessageBoxButtons.OK, MessageBoxIcon.Error);
-			}
-		}
-
-		private void DisconnectFromVideoServer()
-		{
-			isConnected = false;
-
-			try
-			{
-				stream?.Close();
-				tcpClient?.Close();
-			}
-			catch { }
-
-			if (receiveThread != null && receiveThread.IsAlive)
-			{
-				receiveThread.Join(2000);
-			}
-
-			// Clear video display and show placeholder
-			if (videoPictureBox.Image != null)
-			{
-				videoPictureBox.Image.Dispose();
-				videoPictureBox.Image = null;
-			}
-
-			Label placeholderLabel = new Label
-			{
-				Text = "Video will appear here when connected",
-				ForeColor = Color.White,
-				BackColor = Color.Transparent,
-				Font = new Font("Arial", 12, FontStyle.Italic),
-				TextAlign = ContentAlignment.MiddleCenter,
-				Dock = DockStyle.Fill
-			};
-			videoPictureBox.Controls.Clear();
-			videoPictureBox.Controls.Add(placeholderLabel);
-		}
-
-		private void DisconnectFromCommandServer()
-		{
-			isCommandConnected = false;
-
-			try
-			{
-				commandStream?.Close();
-				commandClient?.Close();
-			}
-			catch { }
-
-			if (commandReceiveThread != null && commandReceiveThread.IsAlive)
-			{
-				commandReceiveThread.Join(2000);
-			}
-
-			// Update UI state
-			connectButton.Enabled = true;
-			disconnectButton.Enabled = false;
-			togglePauseButton.Enabled = false;
-			togglePauseButton.Text = "Toggle Pause";
-			togglePauseButton.BackColor = Color.Orange;
-			chatTextBox.Enabled = false;
-			sendChatButton.Enabled = false;
-			serverIpTextBox.Enabled = true;
-			statusLabel.Text = "Disconnected";
-			statusLabel.ForeColor = Color.Red;
-			fpsLabel.Text = "FPS: 0";
-
-			isPaused = false;
-			this.Text = "Video Streaming Client with Commands";
 		}
 
 		private void ReceiveVideo()
@@ -763,7 +662,7 @@ namespace VideoStreamingClient
 						{
 							MessageBox.Show($"Video receive error: {ex.Message}", "Error",
 								MessageBoxButtons.OK, MessageBoxIcon.Error);
-							DisconnectFromVideoServer();
+							DisconnectAll();
 						}));
 					}
 					break;
@@ -802,8 +701,7 @@ namespace VideoStreamingClient
 
 		protected override void OnFormClosing(FormClosingEventArgs e)
 		{
-			DisconnectFromVideoServer();
-			DisconnectFromCommandServer();
+			DisconnectAll();
 			base.OnFormClosing(e);
 		}
 	}
