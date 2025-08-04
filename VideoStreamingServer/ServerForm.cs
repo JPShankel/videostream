@@ -11,6 +11,7 @@ using System.Runtime.InteropServices;
 using System.Collections.Generic;
 using System.Text;
 using Newtonsoft.Json;
+using System.Collections.Concurrent;
 
 // Alternative: Use AForge.NET instead of DirectShow
 // Install-Package AForge.Video
@@ -51,6 +52,10 @@ namespace VideoStreamingServer
 		private readonly object commandLock = new object();
 		private Queue<string> pendingCommands = new Queue<string>();
 		private bool streamPaused = false;
+
+		// Command client management for echoing
+		private ConcurrentBag<TcpClient> commandClients = new ConcurrentBag<TcpClient>();
+		private readonly object commandClientsLock = new object();
 
 		public ServerForm()
 		{
@@ -255,7 +260,7 @@ namespace VideoStreamingServer
 
 				isStreaming = true;
 				startButton.Enabled = false;
-				stopButton.Enabled = false;
+				stopButton.Enabled = true;
 				cameraComboBox.Enabled = false;
 				statusLabel.Text = $"Server started - Video: {VIDEO_PORT}, Commands: {COMMAND_PORT}";
 				statusLabel.ForeColor = Color.Green;
@@ -276,6 +281,20 @@ namespace VideoStreamingServer
 
 			// Stop camera
 			CleanupCamera();
+
+			// Close all command clients
+			lock (commandClientsLock)
+			{
+				var clientList = new List<TcpClient>();
+				while (commandClients.TryTake(out TcpClient client))
+				{
+					try
+					{
+						client?.Close();
+					}
+					catch { }
+				}
+			}
 
 			// Stop TCP servers
 			tcpListener?.Stop();
@@ -387,8 +406,8 @@ namespace VideoStreamingServer
 					using (Bitmap originalFrame = (Bitmap)eventArgs.Frame.Clone())
 					{
 						// Scale down for better performance
-						int newWidth = Math.Min(640, originalFrame.Width / 2);
-						int newHeight = Math.Min(480, originalFrame.Height / 2);
+						int newWidth = Math.Min(640, originalFrame.Width);
+						int newHeight = Math.Min(480, originalFrame.Height);
 
 						// Ensure minimum size
 						if (newWidth < 160) newWidth = 160;
@@ -744,6 +763,12 @@ namespace VideoStreamingServer
 		{
 			try
 			{
+				// Add client to the list for echoing
+				lock (commandClientsLock)
+				{
+					commandClients.Add(client);
+				}
+
 				Interlocked.Increment(ref connectedCommandClients);
 				this.Invoke(new Action(() => UpdateClientCounts()));
 
@@ -752,6 +777,20 @@ namespace VideoStreamingServer
 			}
 			finally
 			{
+				// Remove client from the list
+				lock (commandClientsLock)
+				{
+					var updatedClients = new ConcurrentBag<TcpClient>();
+					while (commandClients.TryTake(out TcpClient existingClient))
+					{
+						if (existingClient != client && existingClient.Connected)
+						{
+							updatedClients.Add(existingClient);
+						}
+					}
+					commandClients = updatedClients;
+				}
+
 				Interlocked.Decrement(ref connectedCommandClients);
 				this.Invoke(new Action(() => UpdateClientCounts()));
 				LogCommand("COMMAND", $"Command client disconnected");
@@ -780,12 +819,18 @@ namespace VideoStreamingServer
 						{
 							if (!string.IsNullOrWhiteSpace(command))
 							{
+								string trimmedCommand = command.Trim();
+
+								// Add to pending commands for video processing
 								lock (commandLock)
 								{
-									pendingCommands.Enqueue(command.Trim());
+									pendingCommands.Enqueue(trimmedCommand);
 								}
 
-								LogCommand("RECEIVED", command.Trim());
+								// Echo the command back to ALL command clients
+								EchoCommandToClients(trimmedCommand, client);
+
+								LogCommand("RECEIVED", trimmedCommand);
 							}
 						}
 					}
@@ -802,6 +847,72 @@ namespace VideoStreamingServer
 			}
 		}
 
+		private void EchoCommandToClients(string command, TcpClient sendingClient)
+		{
+			// Create echo response with timestamp and sender info
+			var echoResponse = new
+			{
+				type = "command_echo",
+				original_command = command,
+				timestamp = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
+				sender = sendingClient.Client.RemoteEndPoint?.ToString() ?? "unknown",
+				server_time = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+			};
+
+			string echoJson = JsonConvert.SerializeObject(echoResponse) + "\n";
+			byte[] echoData = Encoding.UTF8.GetBytes(echoJson);
+
+			lock (commandClientsLock)
+			{
+				var clientsToRemove = new List<TcpClient>();
+				var activeClients = new List<TcpClient>();
+
+				// Get all current clients
+				while (commandClients.TryTake(out TcpClient client))
+				{
+					activeClients.Add(client);
+				}
+
+				// Send echo to all connected command clients
+				foreach (TcpClient client in activeClients)
+				{
+					try
+					{
+						if (client.Connected)
+						{
+							NetworkStream clientStream = client.GetStream();
+							clientStream.Write(echoData, 0, echoData.Length);
+							clientStream.Flush();
+
+							// Add back to collection
+							commandClients.Add(client);
+						}
+						else
+						{
+							clientsToRemove.Add(client);
+						}
+					}
+					catch (Exception ex)
+					{
+						LogCommand("ERROR", $"Failed to echo command to client {client.Client.RemoteEndPoint}: {ex.Message}");
+						clientsToRemove.Add(client);
+					}
+				}
+
+				// Clean up disconnected clients
+				foreach (TcpClient clientToRemove in clientsToRemove)
+				{
+					try
+					{
+						clientToRemove.Close();
+					}
+					catch { }
+				}
+			}
+
+			LogCommand("ECHO", $"Command echoed to {commandClients.Count} clients");
+		}
+
 		private void UpdateClientCounts()
 		{
 			clientCountLabel.Text = $"Video clients: {connectedClients}";
@@ -816,7 +927,7 @@ namespace VideoStreamingServer
 				return;
 			}
 
-			string timestamp = DateTime.Now.ToString("HH:mm:ss");
+			string timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
 			string logEntry = $"[{timestamp}] [{type}] {message}\n";
 
 			commandLogTextBox.AppendText(logEntry);
@@ -960,6 +1071,20 @@ namespace VideoStreamingServer
 		{
 			isStreaming = false;
 			CleanupCamera();
+
+			// Close all command clients
+			lock (commandClientsLock)
+			{
+				while (commandClients.TryTake(out TcpClient client))
+				{
+					try
+					{
+						client?.Close();
+					}
+					catch { }
+				}
+			}
+
 			tcpListener?.Stop();
 			commandListener?.Stop();
 
