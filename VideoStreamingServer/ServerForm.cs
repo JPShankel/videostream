@@ -75,6 +75,12 @@ namespace VideoStreamingServer
 		private Queue<string> pendingCommands = new Queue<string>();
 		private bool streamPaused = false;
 
+		// Persistent chat message storage
+		private readonly object lastChatLock = new object();
+		private string lastChatMessage = "";
+		private string lastChatSender = "";
+		private DateTime lastChatTimestamp = DateTime.MinValue;
+
 		// Command client management for echoing
 		private ConcurrentBag<TcpClient> commandClients = new ConcurrentBag<TcpClient>();
 		private readonly object commandClientsLock = new object();
@@ -636,6 +642,14 @@ namespace VideoStreamingServer
 			UpdateClientCounts();
 
 			LogCommand("SERVER", "Server stopped");
+
+			// Clear last chat message when server stops
+			lock (lastChatLock)
+			{
+				lastChatMessage = "";
+				lastChatSender = "";
+				lastChatTimestamp = DateTime.MinValue;
+			}
 		}
 
 		private bool InitializeCamera()
@@ -746,6 +760,9 @@ namespace VideoStreamingServer
 								{
 									DrawNetworkSimulationIndicators(g, newWidth, newHeight);
 								}
+
+								// Always draw the last chat message (if any) on every frame
+								DrawLastChatMessage(g, newWidth, newHeight);
 							}
 
 							// Convert to JPEG byte array
@@ -763,6 +780,97 @@ namespace VideoStreamingServer
 				{
 					hasNewFrame = false;
 					currentFrame = null;
+				}
+			}
+		}
+
+		private void DrawLastChatMessage(Graphics g, int width, int height)
+		{
+			lock (lastChatLock)
+			{
+				// Only draw if we have a chat message
+				if (!string.IsNullOrEmpty(lastChatMessage))
+				{
+					try
+					{
+						// Calculate age of message for visual effects
+						TimeSpan messageAge = DateTime.Now - lastChatTimestamp;
+						bool isRecentMessage = messageAge.TotalSeconds <= 30; // Highlight recent messages
+
+						// Prepare display text
+						string displayText = string.IsNullOrEmpty(lastChatSender) ?
+							lastChatMessage :
+							$"{lastChatSender}: {lastChatMessage}";
+
+						// Truncate long messages
+						if (displayText.Length > 50)
+						{
+							displayText = displayText.Substring(0, 47) + "...";
+						}
+
+						// Calculate overlay dimensions and position
+						using (Font chatFont = new Font("Arial", 11, FontStyle.Bold))
+						{
+							SizeF textSize = g.MeasureString(displayText, chatFont);
+
+							// Position at bottom-left corner with some padding
+							float overlayX = 10;
+							float overlayY = height - textSize.Height - 25;
+							float overlayWidth = Math.Min(textSize.Width + 20, width - 20);
+							float overlayHeight = textSize.Height + 12;
+
+							// Choose background color based on message age
+							Color backgroundColor = isRecentMessage ?
+								Color.FromArgb(200, Color.DarkBlue) :
+								Color.FromArgb(150, Color.DarkGray);
+
+							// Draw background
+							using (SolidBrush backgroundBrush = new SolidBrush(backgroundColor))
+							{
+								g.FillRectangle(backgroundBrush, overlayX, overlayY, overlayWidth, overlayHeight);
+							}
+
+							// Draw border
+							Color borderColor = isRecentMessage ? Color.Cyan : Color.Gray;
+							using (Pen borderPen = new Pen(borderColor, 1))
+							{
+								g.DrawRectangle(borderPen, overlayX, overlayY, overlayWidth, overlayHeight);
+							}
+
+							// Draw "CHAT:" label
+							using (SolidBrush labelBrush = new SolidBrush(isRecentMessage ? Color.Yellow : Color.LightGray))
+							{
+								g.DrawString("CHAT:", new Font("Arial", 9, FontStyle.Bold),
+									labelBrush, overlayX + 5, overlayY + 3);
+							}
+
+							// Draw the actual chat message
+							using (SolidBrush textBrush = new SolidBrush(Color.White))
+							{
+								SizeF labelSize = g.MeasureString("CHAT:", new Font("Arial", 9, FontStyle.Bold));
+								g.DrawString(displayText, new Font("Arial", 9, FontStyle.Regular),
+									textBrush, overlayX + labelSize.Width + 8, overlayY + 5);
+							}
+
+							// Add timestamp indicator for recent messages
+							if (isRecentMessage)
+							{
+								string timeAgo = $"{(int)messageAge.TotalSeconds}s ago";
+								using (Font timeFont = new Font("Arial", 7, FontStyle.Italic))
+								using (SolidBrush timeBrush = new SolidBrush(Color.LightGray))
+								{
+									SizeF timeSize = g.MeasureString(timeAgo, timeFont);
+									g.DrawString(timeAgo, timeFont, timeBrush,
+										overlayX + overlayWidth - timeSize.Width - 5,
+										overlayY + overlayHeight - timeSize.Height - 2);
+								}
+							}
+						}
+					}
+					catch (Exception ex)
+					{
+						LogCommand("ERROR", $"Error drawing last chat message: {ex.Message}");
+					}
 				}
 			}
 		}
@@ -790,7 +898,7 @@ namespace VideoStreamingServer
 					g.DrawString($"Lat: {latencyMs}ms", new Font("Arial", 7), textBrush, width - 195, height - 60);
 					g.DrawString($"Loss: {packetLossPercent}%", new Font("Arial", 7), textBrush, width - 195, height - 45);
 
-					string bwText = bandwidthLimitKbps == 0 ? "BW: ?" : $"BW: {bandwidthLimitKbps}K";
+					string bwText = bandwidthLimitKbps == 0 ? "BW: ∞" : $"BW: {bandwidthLimitKbps}K";
 					g.DrawString(bwText, new Font("Arial", 7), textBrush, width - 195, height - 30);
 
 					if (enableRandomDropouts)
@@ -913,6 +1021,9 @@ namespace VideoStreamingServer
 						case "chat":
 							HandleChatCommand(g, commandObj, width, height);
 							break;
+						case "clearchat":
+							HandleClearChatCommand(commandObj);
+							break;
 					}
 				}
 			}
@@ -928,16 +1039,42 @@ namespace VideoStreamingServer
 			{
 				string message = GetValueOrDefault(command, "message", "").ToString();
 				string sender = GetValueOrDefault(command, "sender", "Unknown").ToString();
-				string timestamp = GetValueOrDefault(command, "timestamp", DateTime.Now.ToString()).ToString();
+
+				// Store as the last chat message
+				lock (lastChatLock)
+				{
+					lastChatMessage = message;
+					lastChatSender = sender;
+					lastChatTimestamp = DateTime.Now;
+				}
 
 				LogCommand("CHAT", $"{sender}: {message}");
-
-				// Draw chat message on video frame
-				DrawChatOverlay(g, $"{sender}: {message}", width, height);
 			}
 			catch (Exception ex)
 			{
 				LogCommand("ERROR", $"HandleChatCommand error: {ex.Message}");
+			}
+		}
+
+		private void HandleClearChatCommand(Dictionary<string, object> command)
+		{
+			try
+			{
+				string clientId = GetValueOrDefault(command, "clientId", "Unknown").ToString();
+
+				// Clear the last chat message
+				lock (lastChatLock)
+				{
+					lastChatMessage = "";
+					lastChatSender = "";
+					lastChatTimestamp = DateTime.MinValue;
+				}
+
+				LogCommand("CLEARCHAT", $"Chat cleared by {clientId}");
+			}
+			catch (Exception ex)
+			{
+				LogCommand("ERROR", $"HandleClearChatCommand error: {ex.Message}");
 			}
 		}
 
@@ -1457,7 +1594,7 @@ namespace VideoStreamingServer
 					int baseDelay = 67;
 					if (networkSimulationEnabled && latencyMs > 0)
 					{
-						// Add random jitter (�20ms)
+						// Add random jitter (±20ms)
 						int jitter = networkRandom.Next(-20, 21);
 						baseDelay += jitter;
 					}
