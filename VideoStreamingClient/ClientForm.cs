@@ -17,6 +17,7 @@ namespace VideoStreamingClient
 		private NetworkStream stream;
 		private NetworkStream commandStream;
 		private Thread receiveThread;
+		private Thread commandReceiveThread;
 		private bool isConnected = false;
 		private bool isCommandConnected = false;
 		private bool isPaused = false;
@@ -31,13 +32,19 @@ namespace VideoStreamingClient
 		private Label statusLabel;
 		private Label commandStatusLabel;
 		private Label fpsLabel;
+		private Label chatDisplayLabel;
 		private Panel controlPanel;
 		private Panel commandPanel;
+		private Panel chatPanel;
+		private TextBox chatTextBox;
+		private Button sendChatButton;
 
 		private int frameCount = 0;
 		private DateTime lastFpsUpdate = DateTime.Now;
 		private const int VIDEO_PORT = 8080;
 		private const int COMMAND_PORT = 8081;
+		private string lastChatMessage = "";
+		private DateTime lastChatTime = DateTime.MinValue;
 
 		public ClientForm()
 		{
@@ -178,6 +185,58 @@ namespace VideoStreamingClient
 				togglePauseButton, commandStatusLabel
 			});
 
+			// Chat panel
+			chatPanel = new Panel
+			{
+				Location = new Point(0, 110),
+				Size = new Size(900, 40),
+				BackColor = Color.LightYellow,
+				Dock = DockStyle.Top
+			};
+
+			Label chatLabel = new Label
+			{
+				Text = "Chat:",
+				Location = new Point(10, 12),
+				Size = new Size(40, 20),
+				Font = new Font("Arial", 9, FontStyle.Bold)
+			};
+
+			chatTextBox = new TextBox
+			{
+				Location = new Point(55, 10),
+				Size = new Size(400, 23),
+				Font = new Font("Arial", 9, FontStyle.Regular),
+				Enabled = false
+			};
+			chatTextBox.KeyPress += ChatTextBox_KeyPress;
+
+			sendChatButton = new Button
+			{
+				Text = "Send",
+				Location = new Point(465, 9),
+				Size = new Size(60, 25),
+				Font = new Font("Arial", 9, FontStyle.Regular),
+				BackColor = Color.LightGreen,
+				Enabled = false
+			};
+			sendChatButton.Click += SendChat_Click;
+
+			chatDisplayLabel = new Label
+			{
+				Text = "No chat messages",
+				Location = new Point(535, 12),
+				Size = new Size(350, 20),
+				Font = new Font("Arial", 9, FontStyle.Italic),
+				ForeColor = Color.Gray,
+				TextAlign = ContentAlignment.MiddleLeft
+			};
+
+			chatPanel.Controls.AddRange(new Control[]
+			{
+				chatLabel, chatTextBox, sendChatButton, chatDisplayLabel
+			});
+
 			// Video display area
 			videoPictureBox = new PictureBox
 			{
@@ -199,7 +258,58 @@ namespace VideoStreamingClient
 			};
 			videoPictureBox.Controls.Add(placeholderLabel);
 
-			this.Controls.AddRange(new Control[] { controlPanel, commandPanel, videoPictureBox });
+			this.Controls.AddRange(new Control[] { controlPanel, commandPanel, chatPanel, videoPictureBox });
+		}
+
+		private void ChatTextBox_KeyPress(object sender, KeyPressEventArgs e)
+		{
+			if (e.KeyChar == (char)Keys.Enter)
+			{
+				e.Handled = true;
+				SendChat_Click(sender, e);
+			}
+		}
+
+		private void SendChat_Click(object sender, EventArgs e)
+		{
+			if (!isCommandConnected)
+			{
+				MessageBox.Show("Commands not connected.", "Not Connected",
+					MessageBoxButtons.OK, MessageBoxIcon.Warning);
+				return;
+			}
+
+			string message = chatTextBox.Text.Trim();
+			if (string.IsNullOrEmpty(message))
+			{
+				return;
+			}
+
+			try
+			{
+				// Create chat command
+				var command = new
+				{
+					type = "CHAT",
+					message = message,
+					timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+					clientId = Environment.MachineName,
+					sender = Environment.UserName
+				};
+
+				string jsonCommand = JsonConvert.SerializeObject(command) + "\n";
+				byte[] commandBytes = Encoding.UTF8.GetBytes(jsonCommand);
+
+				commandStream.Write(commandBytes, 0, commandBytes.Length);
+				commandStream.Flush();
+
+				chatTextBox.Clear();
+			}
+			catch (Exception ex)
+			{
+				MessageBox.Show($"Failed to send chat message: {ex.Message}", "Chat Error",
+					MessageBoxButtons.OK, MessageBoxIcon.Error);
+			}
 		}
 
 		private void Connect_Click(object sender, EventArgs e)
@@ -213,10 +323,12 @@ namespace VideoStreamingClient
 
 			try
 			{
-				statusLabel.Text = "Video: Connecting...";
+				statusLabel.Text = "Connecting...";
 				statusLabel.ForeColor = Color.Orange;
+				connectButton.Enabled = false;
 				Application.DoEvents();
 
+				// Connect to video stream
 				tcpClient = new TcpClient();
 				tcpClient.Connect(serverIpTextBox.Text, VIDEO_PORT);
 				stream = tcpClient.GetStream();
@@ -226,10 +338,23 @@ namespace VideoStreamingClient
 				receiveThread.IsBackground = true;
 				receiveThread.Start();
 
-				connectButton.Enabled = false;
+				// Connect to command stream
+				commandClient = new TcpClient();
+				commandClient.Connect(serverIpTextBox.Text, COMMAND_PORT);
+				commandStream = commandClient.GetStream();
+
+				isCommandConnected = true;
+				commandReceiveThread = new Thread(ReceiveCommands);
+				commandReceiveThread.IsBackground = true;
+				commandReceiveThread.Start();
+
+				// Update UI for successful connection
 				disconnectButton.Enabled = true;
+				togglePauseButton.Enabled = true;
+				chatTextBox.Enabled = true;
+				sendChatButton.Enabled = true;
 				serverIpTextBox.Enabled = false;
-				statusLabel.Text = "Video: Connected";
+				statusLabel.Text = "Connected (Video + Commands)";
 				statusLabel.ForeColor = Color.Green;
 
 				// Clear placeholder
@@ -237,9 +362,14 @@ namespace VideoStreamingClient
 			}
 			catch (Exception ex)
 			{
-				statusLabel.Text = "Video: Connection failed";
+				// Clean up on connection failure
+				DisconnectFromVideoServer();
+				DisconnectFromCommandServer();
+
+				statusLabel.Text = "Connection failed";
 				statusLabel.ForeColor = Color.Red;
-				MessageBox.Show($"Video connection failed: {ex.Message}", "Connection Error",
+				connectButton.Enabled = true;
+				MessageBox.Show($"Connection failed: {ex.Message}", "Connection Error",
 					MessageBoxButtons.OK, MessageBoxIcon.Error);
 			}
 		}
@@ -247,6 +377,7 @@ namespace VideoStreamingClient
 		private void Disconnect_Click(object sender, EventArgs e)
 		{
 			DisconnectFromVideoServer();
+			DisconnectFromCommandServer();
 		}
 
 		private void ConnectCommand_Click(object sender, EventArgs e)
@@ -269,9 +400,17 @@ namespace VideoStreamingClient
 				commandStream = commandClient.GetStream();
 
 				isCommandConnected = true;
+
+				// Start command receive thread to listen for echoes
+				commandReceiveThread = new Thread(ReceiveCommands);
+				commandReceiveThread.IsBackground = true;
+				commandReceiveThread.Start();
+
 				connectCommandButton.Enabled = false;
 				disconnectCommandButton.Enabled = true;
 				togglePauseButton.Enabled = true;
+				chatTextBox.Enabled = true;
+				sendChatButton.Enabled = true;
 				commandStatusLabel.Text = "Commands: Connected";
 				commandStatusLabel.ForeColor = Color.Green;
 			}
@@ -289,11 +428,111 @@ namespace VideoStreamingClient
 			DisconnectFromCommandServer();
 		}
 
+		private void ReceiveCommands()
+		{
+			byte[] buffer = new byte[4096];
+			StringBuilder messageBuffer = new StringBuilder();
+
+			while (isCommandConnected)
+			{
+				try
+				{
+					int bytesRead = commandStream.Read(buffer, 0, buffer.Length);
+					if (bytesRead == 0)
+					{
+						break; // Connection closed
+					}
+
+					string data = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+					messageBuffer.Append(data);
+
+					// Process complete messages (separated by newlines)
+					string content = messageBuffer.ToString();
+					string[] lines = content.Split('\n');
+
+					for (int i = 0; i < lines.Length - 1; i++)
+					{
+						if (!string.IsNullOrWhiteSpace(lines[i]))
+						{
+							ProcessReceivedCommand(lines[i].Trim());
+						}
+					}
+
+					// Keep the last incomplete line
+					messageBuffer.Clear();
+					if (lines.Length > 0)
+					{
+						messageBuffer.Append(lines[lines.Length - 1]);
+					}
+				}
+				catch (Exception ex)
+				{
+					if (isCommandConnected)
+					{
+						this.Invoke(new Action(() =>
+						{
+							MessageBox.Show($"Command receive error: {ex.Message}", "Error",
+								MessageBoxButtons.OK, MessageBoxIcon.Error);
+						}));
+					}
+					break;
+				}
+			}
+		}
+
+		private void ProcessReceivedCommand(string commandJson)
+		{
+			try
+			{
+				var command = JsonConvert.DeserializeObject<Dictionary<string, object>>(commandJson);
+
+				if (command.ContainsKey("type"))
+				{
+					string type = command["type"].ToString();
+
+					if (type.Equals("command_echo", StringComparison.OrdinalIgnoreCase))
+					{
+						// Process echoed command
+						if (command.ContainsKey("original_command"))
+						{
+							string originalCommand = command["original_command"].ToString();
+							var originalCommandObj = JsonConvert.DeserializeObject<Dictionary<string, object>>(originalCommand);
+
+							if (originalCommandObj.ContainsKey("type") &&
+								originalCommandObj["type"].ToString().Equals("CHAT", StringComparison.OrdinalIgnoreCase))
+							{
+								// Update chat display
+								string message = originalCommandObj.ContainsKey("message") ?
+									originalCommandObj["message"].ToString() : "";
+								string sender = originalCommandObj.ContainsKey("sender") ?
+									originalCommandObj["sender"].ToString() : "Unknown";
+								string timestamp = originalCommandObj.ContainsKey("timestamp") ?
+									originalCommandObj["timestamp"].ToString() : DateTime.Now.ToString();
+
+								this.Invoke(new Action(() =>
+								{
+									lastChatMessage = $"{sender}: {message}";
+									lastChatTime = DateTime.Now;
+									chatDisplayLabel.Text = $"Last: {lastChatMessage}";
+									chatDisplayLabel.ForeColor = Color.DarkGreen;
+								}));
+							}
+						}
+					}
+				}
+			}
+			catch (Exception ex)
+			{
+				// Log error but don't show message box for parsing errors
+				Console.WriteLine($"Error processing received command: {ex.Message}");
+			}
+		}
+
 		private void TogglePause_Click(object sender, EventArgs e)
 		{
 			if (!isCommandConnected)
 			{
-				MessageBox.Show("Please connect to command stream first.", "Not Connected",
+				MessageBox.Show("Commands not connected.", "Not Connected",
 					MessageBoxButtons.OK, MessageBoxIcon.Warning);
 				return;
 			}
@@ -388,13 +627,6 @@ namespace VideoStreamingClient
 				receiveThread.Join(2000);
 			}
 
-			connectButton.Enabled = true;
-			disconnectButton.Enabled = false;
-			serverIpTextBox.Enabled = true;
-			statusLabel.Text = "Video: Disconnected";
-			statusLabel.ForeColor = Color.Red;
-			fpsLabel.Text = "FPS: 0";
-
 			// Clear video display and show placeholder
 			if (videoPictureBox.Image != null)
 			{
@@ -413,8 +645,6 @@ namespace VideoStreamingClient
 			};
 			videoPictureBox.Controls.Clear();
 			videoPictureBox.Controls.Add(placeholderLabel);
-
-			this.Text = "Video Streaming Client with Commands";
 		}
 
 		private void DisconnectFromCommandServer()
@@ -428,13 +658,23 @@ namespace VideoStreamingClient
 			}
 			catch { }
 
-			connectCommandButton.Enabled = true;
-			disconnectCommandButton.Enabled = false;
+			if (commandReceiveThread != null && commandReceiveThread.IsAlive)
+			{
+				commandReceiveThread.Join(2000);
+			}
+
+			// Update UI state
+			connectButton.Enabled = true;
+			disconnectButton.Enabled = false;
 			togglePauseButton.Enabled = false;
 			togglePauseButton.Text = "Toggle Pause";
 			togglePauseButton.BackColor = Color.Orange;
-			commandStatusLabel.Text = "Commands: Disconnected";
-			commandStatusLabel.ForeColor = Color.Red;
+			chatTextBox.Enabled = false;
+			sendChatButton.Enabled = false;
+			serverIpTextBox.Enabled = true;
+			statusLabel.Text = "Disconnected";
+			statusLabel.ForeColor = Color.Red;
+			fpsLabel.Text = "FPS: 0";
 
 			isPaused = false;
 			this.Text = "Video Streaming Client with Commands";
@@ -492,7 +732,16 @@ namespace VideoStreamingClient
 							{
 								videoPictureBox.Image.Dispose();
 							}
-							videoPictureBox.Image = frame;
+
+							// Create a copy of the image with chat overlay
+							Bitmap frameWithChat = new Bitmap(frame);
+							using (Graphics g = Graphics.FromImage(frameWithChat))
+							{
+								DrawChatOverlay(g, frameWithChat.Width, frameWithChat.Height);
+							}
+
+							videoPictureBox.Image = frameWithChat;
+							frame.Dispose();
 
 							// Update FPS counter
 							frameCount++;
@@ -522,68 +771,40 @@ namespace VideoStreamingClient
 			}
 		}
 
+		private void DrawChatOverlay(Graphics g, int width, int height)
+		{
+			if (!string.IsNullOrEmpty(lastChatMessage) &&
+				(DateTime.Now - lastChatTime).TotalSeconds < 10) // Show chat for 10 seconds
+			{
+				// Draw semi-transparent background
+				using (SolidBrush backgroundBrush = new SolidBrush(Color.FromArgb(180, Color.Black)))
+				{
+					using (Font chatFont = new Font("Arial", 12, FontStyle.Bold))
+					{
+						SizeF textSize = g.MeasureString(lastChatMessage, chatFont);
+						RectangleF backgroundRect = new RectangleF(
+							10, 10,
+							Math.Min(textSize.Width + 20, width - 20),
+							textSize.Height + 10
+						);
+
+						g.FillRectangle(backgroundBrush, backgroundRect);
+
+						// Draw chat text
+						using (SolidBrush textBrush = new SolidBrush(Color.White))
+						{
+							g.DrawString(lastChatMessage, chatFont, textBrush, 20, 15);
+						}
+					}
+				}
+			}
+		}
+
 		protected override void OnFormClosing(FormClosingEventArgs e)
 		{
 			DisconnectFromVideoServer();
 			DisconnectFromCommandServer();
 			base.OnFormClosing(e);
-		}
-
-		// Additional helper methods for quick drawing commands
-		private void AddDrawingButtons()
-		{
-			Button drawLineButton = new Button
-			{
-				Text = "Draw Line",
-				Location = new Point(650, 12),
-				Size = new Size(80, 27),
-				Font = new Font("Arial", 8, FontStyle.Regular),
-				BackColor = Color.LightYellow,
-				Enabled = false
-			};
-			drawLineButton.Click += (s, e) => {
-				SendDrawCommand("line", new
-				{
-					x1 = 50,
-					y1 = 50,
-					x2 = 150,
-					y2 = 150,
-					color = "Red",
-					thickness = 3
-				});
-			};
-
-			Button drawRectButton = new Button
-			{
-				Text = "Draw Rect",
-				Location = new Point(740, 12),
-				Size = new Size(80, 27),
-				Font = new Font("Arial", 8, FontStyle.Regular),
-				BackColor = Color.LightYellow,
-				Enabled = false
-			};
-			drawRectButton.Click += (s, e) => {
-				SendDrawCommand("rectangle", new
-				{
-					x = 100,
-					y = 100,
-					width = 80,
-					height = 60,
-					color = "Blue",
-					filled = false
-				});
-			};
-
-			// Enable/disable drawing buttons with command connection
-			EventHandler updateDrawingButtons = (s, e) => {
-				drawLineButton.Enabled = isCommandConnected;
-				drawRectButton.Enabled = isCommandConnected;
-			};
-
-			connectCommandButton.Click += updateDrawingButtons;
-			disconnectCommandButton.Click += updateDrawingButtons;
-
-			commandPanel.Controls.AddRange(new Control[] { drawLineButton, drawRectButton });
 		}
 	}
 }

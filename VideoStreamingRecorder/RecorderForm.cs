@@ -34,6 +34,8 @@ namespace VideoStreamRecorder.Forms
 		private int commandCount = 0;
 		private DateTime lastFrameTime = DateTime.MinValue;
 		private bool isFirstCommand = true;
+		private string lastChatMessage = "";
+		private DateTime lastChatTime = DateTime.MinValue;
 
 		// Recording files
 		private string? currentVideoFile;
@@ -185,6 +187,8 @@ namespace VideoStreamRecorder.Forms
 				frameBuffer.Clear();
 				expectingFrameHeader = true;
 				expectedFrameSize = 0;
+				lastChatMessage = "";
+				lastChatTime = DateTime.MinValue;
 
 				UpdateUI();
 				LogMessage("Disconnected from server");
@@ -508,6 +512,29 @@ namespace VideoStreamRecorder.Forms
 				Cv2.PutText(frame, "REC", new OpenCvSharp.Point(frame.Width - 70, 60),
 					HersheyFonts.HersheySimplex, 0.8, new Scalar(255, 255, 255), 2);
 			}
+
+			// Add chat overlay if there's a recent message
+			if (!string.IsNullOrEmpty(lastChatMessage) &&
+				(DateTime.Now - lastChatTime).TotalSeconds < 15) // Show for 15 seconds
+			{
+				// Draw semi-transparent background for chat
+				var chatBackground = new OpenCvSharp.Rect(10, 10, Math.Min(frame.Width - 20, 500), 50);
+				Cv2.Rectangle(frame, chatBackground, new Scalar(0, 0, 0, 180), -1);
+
+				// Draw chat text
+				Cv2.PutText(frame, "CHAT:", new OpenCvSharp.Point(20, 35),
+					HersheyFonts.HersheySimplex, 0.7, new Scalar(0, 255, 255), 2);
+
+				// Truncate message if too long
+				string displayMessage = lastChatMessage;
+				if (displayMessage.Length > 60)
+				{
+					displayMessage = displayMessage.Substring(0, 57) + "...";
+				}
+
+				Cv2.PutText(frame, displayMessage, new OpenCvSharp.Point(80, 35),
+					HersheyFonts.HersheySimplex, 0.6, new Scalar(255, 255, 255), 1);
+			}
 		}
 
 		// Helper method to detect image data
@@ -604,12 +631,17 @@ namespace VideoStreamRecorder.Forms
 				{
 					if (!string.IsNullOrWhiteSpace(lines[i]))
 					{
+						string commandLine = lines[i].Trim();
+
 						var command = new CommandEntry
 						{
 							Timestamp = DateTime.UtcNow,
-							Command = lines[i].Trim(),
+							Command = commandLine,
 							Source = "command_stream"
 						};
+
+						// Check if this is a chat command echo
+						ProcessChatCommand(commandLine);
 
 						// Save to command log if recording
 						if (isRecording && commandLogWriter != null)
@@ -620,7 +652,7 @@ namespace VideoStreamRecorder.Forms
 						Invoke(() =>
 						{
 							commandCount++;
-							LogMessage($"Command: {command.Command}");
+							LogMessage($"Command: {commandLine}");
 						});
 					}
 				}
@@ -635,6 +667,51 @@ namespace VideoStreamRecorder.Forms
 			catch (Exception ex)
 			{
 				Invoke(() => LogMessage($"Error processing commands: {ex.Message}"));
+			}
+		}
+
+		private void ProcessChatCommand(string commandJson)
+		{
+			try
+			{
+				var command = JsonSerializer.Deserialize<Dictionary<string, object>>(commandJson);
+
+				if (command.ContainsKey("type"))
+				{
+					string type = command["type"].ToString();
+
+					if (type.Equals("command_echo", StringComparison.OrdinalIgnoreCase))
+					{
+						// Process echoed command
+						if (command.ContainsKey("original_command"))
+						{
+							string originalCommand = command["original_command"].ToString();
+							var originalCommandObj = JsonSerializer.Deserialize<Dictionary<string, object>>(originalCommand);
+
+							if (originalCommandObj.ContainsKey("type") &&
+								originalCommandObj["type"].ToString().Equals("CHAT", StringComparison.OrdinalIgnoreCase))
+							{
+								// Extract chat message
+								string message = originalCommandObj.ContainsKey("message") ?
+									originalCommandObj["message"].ToString() : "";
+								string sender = originalCommandObj.ContainsKey("sender") ?
+									originalCommandObj["sender"].ToString() : "Unknown";
+
+								Invoke(() =>
+								{
+									lastChatMessage = $"{sender}: {message}";
+									lastChatTime = DateTime.Now;
+									LogMessage($"Chat: {lastChatMessage}");
+								});
+							}
+						}
+					}
+				}
+			}
+			catch (Exception ex)
+			{
+				// Log parsing errors but don't crash
+				LogMessage($"Error parsing command for chat: {ex.Message}");
 			}
 		}
 
@@ -853,7 +930,6 @@ namespace VideoStreamRecorder.Forms
 				LogMessage($"Output directory: {folderBrowserDialog.SelectedPath}");
 			}
 		}
-
 		private void UpdateUI()
 		{
 			if (InvokeRequired)
