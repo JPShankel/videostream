@@ -1019,7 +1019,7 @@ namespace VideoStreamingClient
 				{
 					if (!commandStream.DataAvailable)
 					{
-						return;
+						continue;
 					}
 					int bytesRead = commandStream.Read(buffer, 0, buffer.Length);
 					if (bytesRead == 0)

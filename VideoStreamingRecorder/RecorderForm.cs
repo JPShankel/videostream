@@ -16,6 +16,16 @@ namespace VideoStreamRecorder.Forms
 		private NetworkStream? commandStream;
 		private bool isConnected = false;
 
+		// Connection management
+		private bool autoReconnectEnabled = true;
+		private int reconnectAttempts = 0;
+		private int maxReconnectAttempts = 5;
+		private int reconnectDelayMs = 2000;
+		private DateTime lastVideoHeartbeat = DateTime.MinValue;
+		private DateTime lastCommandHeartbeat = DateTime.MinValue;
+		private CancellationTokenSource? connectionMonitorCts;
+		private bool isReconnecting = false;
+
 		// Recording state
 		private bool isRecording = false;
 		private DateTime recordingStartTime;
@@ -118,40 +128,9 @@ namespace VideoStreamRecorder.Forms
 			{
 				buttonConnect.Enabled = false;
 				buttonConnect.Text = "Connecting...";
+				reconnectAttempts = 0;
 
-				var serverIP = textBoxServerIP.Text;
-				var videoPort = (int)numericUpDownVideoPort.Value;
-				var commandPort = (int)numericUpDownCommandPort.Value;
-
-				LogMessage($"Connecting to video stream at {serverIP}:{videoPort}");
-				LogMessage($"Connecting to command stream at {serverIP}:{commandPort}");
-
-				// Connect to video stream
-				videoClient = new TcpClient();
-				await videoClient.ConnectAsync(serverIP, videoPort);
-				videoStream = videoClient.GetStream();
-				LogMessage("Video stream connected");
-
-				// Connect to command stream
-				commandClient = new TcpClient();
-				await commandClient.ConnectAsync(serverIP, commandPort);
-				commandStream = commandClient.GetStream();
-				LogMessage("Command stream connected");
-
-				isConnected = true;
-				UpdateUI();
-
-				LogMessage("Connected to both video and command streams");
-
-				// Reset frame buffer
-				frameBuffer.Clear();
-				expectingFrameHeader = true;
-				expectedFrameSize = 0;
-
-				// Start receiving data from both streams
-				cancellationTokenSource = new CancellationTokenSource();
-				_ = Task.Run(() => ReceiveVideoDataAsync(cancellationTokenSource.Token));
-				_ = Task.Run(() => ReceiveCommandDataAsync(cancellationTokenSource.Token));
+				await EstablishConnectionAsync();
 			}
 			catch (Exception ex)
 			{
@@ -167,19 +146,254 @@ namespace VideoStreamRecorder.Forms
 			}
 		}
 
+		private async Task EstablishConnectionAsync()
+		{
+			var serverIP = textBoxServerIP.Text;
+			var videoPort = (int)numericUpDownVideoPort.Value;
+			var commandPort = (int)numericUpDownCommandPort.Value;
+
+			LogMessage($"Connecting to video stream at {serverIP}:{videoPort}");
+			LogMessage($"Connecting to command stream at {serverIP}:{commandPort}");
+
+			// Connect to video stream with timeout
+			videoClient = new TcpClient();
+			videoClient.ReceiveTimeout = 30000; // 30 second timeout
+			videoClient.SendTimeout = 30000;
+
+			var videoConnectTask = videoClient.ConnectAsync(serverIP, videoPort);
+			if (!await WaitForTaskWithTimeout(videoConnectTask, 10000))
+			{
+				throw new TimeoutException("Video stream connection timeout");
+			}
+
+			videoStream = videoClient.GetStream();
+			LogMessage("Video stream connected");
+
+			// Connect to command stream with timeout
+			commandClient = new TcpClient();
+			commandClient.ReceiveTimeout = 30000;
+			commandClient.SendTimeout = 30000;
+
+			var commandConnectTask = commandClient.ConnectAsync(serverIP, commandPort);
+
+			commandStream = commandClient.GetStream();
+			LogMessage("Command stream connected");
+
+			isConnected = true;
+			reconnectAttempts = 0;
+			lastVideoHeartbeat = DateTime.Now;
+			lastCommandHeartbeat = DateTime.Now;
+
+			UpdateUI();
+			LogMessage("Connected to both video and command streams");
+
+			// Reset frame buffer
+			frameBuffer.Clear();
+			expectingFrameHeader = true;
+			expectedFrameSize = 0;
+
+			// Start receiving data from both streams
+			cancellationTokenSource = new CancellationTokenSource();
+			_ = Task.Run(() => ReceiveVideoDataAsync(cancellationTokenSource.Token));
+			_ = Task.Run(() => ReceiveCommandDataAsync(cancellationTokenSource.Token));
+
+			// Start connection monitoring
+			connectionMonitorCts = new CancellationTokenSource();
+			_ = Task.Run(() => MonitorConnectionHealthAsync(connectionMonitorCts.Token));
+		}
+
+		private async Task<bool> WaitForTaskWithTimeout(Task task, int timeoutMs)
+		{
+			var timeoutTask = Task.Delay(timeoutMs);
+			var completedTask = await Task.WhenAny(task, timeoutTask);
+			return completedTask == task;
+		}
+
+		private async Task MonitorConnectionHealthAsync(CancellationToken cancellationToken)
+		{
+			try
+			{
+				LogMessage("Connection monitoring started");
+
+				while (isConnected && !cancellationToken.IsCancellationRequested)
+				{
+					await Task.Delay(5000, cancellationToken); // Check every 5 seconds
+
+					if (!isConnected) break;
+
+					bool videoHealthy = CheckStreamHealth(videoClient, lastVideoHeartbeat, "video");
+
+					if (!videoHealthy)
+					{
+						LogMessage("Connection health check failed - triggering reconnection");
+						await HandleConnectionLoss();
+						break;
+					}
+				}
+			}
+			catch (OperationCanceledException)
+			{
+				LogMessage("Connection monitoring cancelled");
+			}
+			catch (Exception ex)
+			{
+				LogMessage($"Connection monitoring error: {ex.Message}");
+			}
+		}
+
+		private bool CheckStreamHealth(TcpClient? client, DateTime lastHeartbeat, string streamName)
+		{
+			if (client == null || !client.Connected)
+			{
+				LogMessage($"{streamName} stream disconnected");
+				return false;
+			}
+
+			// Check if we've received data recently (within 30 seconds)
+			var timeSinceLastData = DateTime.Now - lastHeartbeat;
+			if (timeSinceLastData.TotalSeconds > 30)
+			{
+				LogMessage($"{streamName} stream timeout - no data for {timeSinceLastData.TotalSeconds:F1} seconds");
+
+				// Try to detect if socket is actually closed
+				try
+				{
+					if (client.Client.Poll(1000, SelectMode.SelectRead) && client.Available == 0)
+					{
+						LogMessage($"{streamName} stream socket closed by remote");
+						return false;
+					}
+				}
+				catch (Exception ex)
+				{
+					LogMessage($"{streamName} stream socket check failed: {ex.Message}");
+					return false;
+				}
+			}
+
+			return true;
+		}
+
+		private async Task HandleConnectionLoss()
+		{
+			if (isReconnecting) return;
+
+			isReconnecting = true;
+			LogMessage("Connection lost - attempting to reconnect");
+
+			// Clean up current connections
+			CleanupConnections();
+
+			// Attempt reconnection if enabled
+			if (autoReconnectEnabled && reconnectAttempts < maxReconnectAttempts)
+			{
+				await AttemptReconnectionAsync();
+			}
+			else
+			{
+				LogMessage("Auto-reconnection disabled or max attempts reached");
+				Invoke(() => DisconnectFromServer());
+			}
+
+			isReconnecting = false;
+		}
+
+		private async Task AttemptReconnectionAsync()
+		{
+			while (autoReconnectEnabled && reconnectAttempts < maxReconnectAttempts && !isConnected)
+			{
+				reconnectAttempts++;
+				LogMessage($"Reconnection attempt {reconnectAttempts}/{maxReconnectAttempts}");
+
+				try
+				{
+					await Task.Delay(reconnectDelayMs);
+					await EstablishConnectionAsync();
+
+					if (isConnected)
+					{
+						LogMessage("Reconnection successful");
+						return;
+					}
+				}
+				catch (Exception ex)
+				{
+					LogMessage($"Reconnection attempt {reconnectAttempts} failed: {ex.Message}");
+				}
+
+				// Exponential backoff with jitter
+				reconnectDelayMs = Math.Min(reconnectDelayMs * 2, 30000);
+				await Task.Delay(1000 + new Random().Next(2000)); // Add jitter
+			}
+
+			if (reconnectAttempts >= maxReconnectAttempts)
+			{
+				LogMessage("Max reconnection attempts reached - giving up");
+				Invoke(() => DisconnectFromServer());
+			}
+		}
+
+		private void CleanupConnections()
+		{
+			try
+			{
+				isConnected = false;
+				cancellationTokenSource?.Cancel();
+				connectionMonitorCts?.Cancel();
+
+				SafeCloseStream(videoStream, "video stream");
+				SafeCloseClient(videoClient, "video client");
+				SafeCloseStream(commandStream, "command stream");
+				SafeCloseClient(commandClient, "command client");
+
+				videoStream = null;
+				videoClient = null;
+				commandStream = null;
+				commandClient = null;
+			}
+			catch (Exception ex)
+			{
+				LogMessage($"Error during connection cleanup: {ex.Message}");
+			}
+		}
+
+		private void SafeCloseStream(NetworkStream? stream, string name)
+		{
+			try
+			{
+				stream?.Close();
+			}
+			catch (Exception ex)
+			{
+				LogMessage($"Error closing {name}: {ex.Message}");
+			}
+		}
+
+		private void SafeCloseClient(TcpClient? client, string name)
+		{
+			try
+			{
+				client?.Close();
+			}
+			catch (Exception ex)
+			{
+				LogMessage($"Error closing {name}: {ex.Message}");
+			}
+		}
+
 		private void DisconnectFromServer()
 		{
 			try
 			{
 				StopRecording();
+				autoReconnectEnabled = false; // Disable auto-reconnect for manual disconnect
 
-				isConnected = false;
-				cancellationTokenSource?.Cancel();
+				CleanupConnections();
 
-				videoStream?.Close();
-				videoClient?.Close();
-				commandStream?.Close();
-				commandClient?.Close();
+				cancellationTokenSource?.Dispose();
+				connectionMonitorCts?.Dispose();
+				cancellationTokenSource = null;
+				connectionMonitorCts = null;
 
 				// Reset counters and buffers
 				frameCount = 0;
@@ -189,6 +403,8 @@ namespace VideoStreamRecorder.Forms
 				expectedFrameSize = 0;
 				lastChatMessage = "";
 				lastChatTime = DateTime.MinValue;
+				reconnectAttempts = 0;
+				reconnectDelayMs = 2000;
 
 				UpdateUI();
 				LogMessage("Disconnected from server");
@@ -196,6 +412,9 @@ namespace VideoStreamRecorder.Forms
 				// Clear preview
 				pictureBoxVideo.Image?.Dispose();
 				pictureBoxVideo.Image = null;
+
+				// Re-enable auto-reconnect for future connections
+				autoReconnectEnabled = true;
 			}
 			catch (Exception ex)
 			{
@@ -217,28 +436,45 @@ namespace VideoStreamRecorder.Forms
 
 				while (isConnected && !cancellationToken.IsCancellationRequested)
 				{
-					if (videoStream != null && videoStream.CanRead)
+					try
 					{
-						int bytesRead = await videoStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
-
-						if (bytesRead == 0)
+						if (videoStream != null && videoStream.CanRead)
 						{
-							Invoke(() => LogMessage("Video stream closed by server"));
-							break;
-						}
+							int bytesRead = await videoStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
 
-						// Add received data to frame buffer
-						for (int i = 0; i < bytesRead; i++)
+							if (bytesRead == 0)
+							{
+								Invoke(() => LogMessage("Video stream closed by server"));
+								await HandleConnectionLoss();
+								break;
+							}
+
+							// Update heartbeat
+							lastVideoHeartbeat = DateTime.Now;
+
+							// Add received data to frame buffer
+							for (int i = 0; i < bytesRead; i++)
+							{
+								frameBuffer.Add(buffer[i]);
+							}
+
+							// Process complete frames from buffer
+							await ProcessFrameBufferAsync(cancellationToken);
+						}
+						else
 						{
-							frameBuffer.Add(buffer[i]);
+							await Task.Delay(10, cancellationToken);
 						}
-
-						// Process complete frames from buffer
-						await ProcessFrameBufferAsync(cancellationToken);
 					}
-					else
+					catch (OperationCanceledException)
 					{
-						await Task.Delay(10, cancellationToken);
+						throw; // Re-throw cancellation
+					}
+					catch (Exception ex)
+					{
+						LogMessage($"Video stream read error: {ex.Message}");
+						await HandleConnectionLoss();
+						break;
 					}
 				}
 			}
@@ -249,6 +485,7 @@ namespace VideoStreamRecorder.Forms
 			catch (Exception ex)
 			{
 				Invoke(() => LogMessage($"Video stream error: {ex.Message}"));
+				await HandleConnectionLoss();
 			}
 		}
 
@@ -430,8 +667,6 @@ namespace VideoStreamRecorder.Forms
 						try
 						{
 							videoWriter.Write(frame);
-							// Force flush to ensure frame is written
-							// Note: OpenCV doesn't have a direct flush, but this ensures the write operation completes
 						}
 						catch (Exception ex)
 						{
@@ -468,6 +703,12 @@ namespace VideoStreamRecorder.Forms
 			Cv2.PutText(frame, "Video Stream Data", new OpenCvSharp.Point(20, 40),
 				HersheyFonts.HersheySimplex, 1.2, new Scalar(0, 255, 0), 2);
 
+			// Show connection status
+			string connectionText = isReconnecting ? "RECONNECTING..." : "CONNECTED";
+			var connectionColor = isReconnecting ? new Scalar(0, 165, 255) : new Scalar(0, 255, 0);
+			Cv2.PutText(frame, connectionText, new OpenCvSharp.Point(400, 40),
+				HersheyFonts.HersheySimplex, 0.8, connectionColor, 2);
+
 			// Show data statistics
 			Cv2.PutText(frame, $"Data size: {frameData.Length} bytes", new OpenCvSharp.Point(20, 80),
 				HersheyFonts.HersheySimplex, 0.8, new Scalar(255, 255, 255), 2);
@@ -475,14 +716,21 @@ namespace VideoStreamRecorder.Forms
 			Cv2.PutText(frame, $"Frame count: {frameCount + 1}", new OpenCvSharp.Point(20, 120),
 				HersheyFonts.HersheySimplex, 0.8, new Scalar(255, 255, 255), 2);
 
+			// Show reconnection status
+			if (reconnectAttempts > 0)
+			{
+				Cv2.PutText(frame, $"Reconnects: {reconnectAttempts}", new OpenCvSharp.Point(20, 160),
+					HersheyFonts.HersheySimplex, 0.8, new Scalar(255, 165, 0), 2);
+			}
+
 			// Show first 64 bytes as a visual pattern
-			Cv2.PutText(frame, "Data pattern:", new OpenCvSharp.Point(20, 160),
+			Cv2.PutText(frame, "Data pattern:", new OpenCvSharp.Point(20, 200),
 				HersheyFonts.HersheySimplex, 0.6, new Scalar(200, 200, 200), 1);
 
 			for (int i = 0; i < Math.Min(64, frameData.Length); i++)
 			{
 				int x = 20 + (i % 32) * 18;
-				int y = 180 + (i / 32) * 18;
+				int y = 220 + (i / 32) * 18;
 				byte value = frameData[i];
 
 				// Create colored square based on byte value
@@ -492,7 +740,7 @@ namespace VideoStreamRecorder.Forms
 
 			// Add hex dump of first 16 bytes
 			var hexString = string.Join(" ", frameData.Take(16).Select(b => b.ToString("X2")));
-			Cv2.PutText(frame, $"Hex: {hexString}", new OpenCvSharp.Point(20, 240),
+			Cv2.PutText(frame, $"Hex: {hexString}", new OpenCvSharp.Point(20, 280),
 				HersheyFonts.HersheySimplex, 0.5, new Scalar(180, 180, 180), 1);
 
 			return frame;
@@ -511,6 +759,18 @@ namespace VideoStreamRecorder.Forms
 				Cv2.Circle(frame, new OpenCvSharp.Point(frame.Width - 50, 50), 25, new Scalar(0, 0, 255), -1);
 				Cv2.PutText(frame, "REC", new OpenCvSharp.Point(frame.Width - 70, 60),
 					HersheyFonts.HersheySimplex, 0.8, new Scalar(255, 255, 255), 2);
+			}
+
+			// Add connection status indicator
+			if (isReconnecting)
+			{
+				Cv2.Circle(frame, new OpenCvSharp.Point(frame.Width - 50, 100), 20, new Scalar(0, 165, 255), -1);
+				Cv2.PutText(frame, "RC", new OpenCvSharp.Point(frame.Width - 65, 110),
+					HersheyFonts.HersheySimplex, 0.6, new Scalar(255, 255, 255), 2);
+			}
+			else if (isConnected)
+			{
+				Cv2.Circle(frame, new OpenCvSharp.Point(frame.Width - 50, 100), 15, new Scalar(0, 255, 0), -1);
 			}
 
 			// Add chat overlay if there's a recent message
@@ -588,25 +848,42 @@ namespace VideoStreamRecorder.Forms
 
 				while (isConnected && !cancellationToken.IsCancellationRequested)
 				{
-					if (commandStream != null && commandStream.CanRead)
+					try
 					{
-						int bytesRead = await commandStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
-
-						if (bytesRead == 0)
+						if (commandStream != null && commandStream.CanRead)
 						{
-							Invoke(() => LogMessage("Command stream closed by server"));
-							break;
+							int bytesRead = await commandStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
+
+							if (bytesRead == 0)
+							{
+								Invoke(() => LogMessage("Command stream closed by server"));
+								await HandleConnectionLoss();
+								break;
+							}
+
+							// Update heartbeat
+							lastCommandHeartbeat = DateTime.Now;
+
+							string data = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+							messageBuffer.Append(data);
+
+							// Process complete command messages
+							ProcessCommandMessages(messageBuffer);
 						}
-
-						string data = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-						messageBuffer.Append(data);
-
-						// Process complete command messages
-						ProcessCommandMessages(messageBuffer);
+						else
+						{
+							await Task.Delay(10, cancellationToken);
+						}
 					}
-					else
+					catch (OperationCanceledException)
 					{
-						await Task.Delay(10, cancellationToken);
+						throw; // Re-throw cancellation
+					}
+					catch (Exception ex)
+					{
+						LogMessage($"Command stream read error: {ex.Message}");
+						await HandleConnectionLoss();
+						break;
 					}
 				}
 			}
@@ -617,6 +894,7 @@ namespace VideoStreamRecorder.Forms
 			catch (Exception ex)
 			{
 				Invoke(() => LogMessage($"Command stream error: {ex.Message}"));
+				await HandleConnectionLoss();
 			}
 		}
 
@@ -930,6 +1208,7 @@ namespace VideoStreamRecorder.Forms
 				LogMessage($"Output directory: {folderBrowserDialog.SelectedPath}");
 			}
 		}
+
 		private void UpdateUI()
 		{
 			if (InvokeRequired)
@@ -941,11 +1220,11 @@ namespace VideoStreamRecorder.Forms
 			// Connection UI
 			if (isConnected)
 			{
-				buttonConnect.Text = "Disconnect";
-				buttonConnect.BackColor = Color.LightCoral;
-				labelConnectionStatus.Text = "Connected to both streams";
-				labelConnectionStatus.ForeColor = Color.Green;
-				buttonStartRecording.Enabled = true;
+				buttonConnect.Text = isReconnecting ? "Reconnecting..." : "Disconnect";
+				buttonConnect.BackColor = isReconnecting ? Color.Orange : Color.LightCoral;
+				labelConnectionStatus.Text = isReconnecting ? "Reconnecting..." : "Connected to both streams";
+				labelConnectionStatus.ForeColor = isReconnecting ? Color.Orange : Color.Green;
+				buttonStartRecording.Enabled = !isReconnecting;
 			}
 			else
 			{
@@ -958,7 +1237,7 @@ namespace VideoStreamRecorder.Forms
 
 			// Recording UI
 			buttonStopRecording.Enabled = isRecording;
-			groupBoxConnection.Enabled = !isRecording;
+			groupBoxConnection.Enabled = !isRecording && !isReconnecting;
 			textBoxOutputPath.Enabled = !isRecording;
 			buttonBrowseOutput.Enabled = !isRecording;
 
@@ -998,8 +1277,18 @@ namespace VideoStreamRecorder.Forms
 			// Update video status based on recent frames
 			if (DateTime.Now - lastFrameTime < TimeSpan.FromSeconds(2) && frameCount > 0)
 			{
-				labelVideoStatus.Text = $"Live video - {frameCount} frames";
+				string statusText = $"Live video - {frameCount} frames";
+				if (reconnectAttempts > 0)
+				{
+					statusText += $" (Reconnected {reconnectAttempts}x)";
+				}
+				labelVideoStatus.Text = statusText;
 				labelVideoStatus.ForeColor = Color.Green;
+			}
+			else if (isReconnecting)
+			{
+				labelVideoStatus.Text = $"Reconnecting... (attempt {reconnectAttempts}/{maxReconnectAttempts})";
+				labelVideoStatus.ForeColor = Color.Orange;
 			}
 			else if (isConnected)
 			{
@@ -1061,6 +1350,76 @@ namespace VideoStreamRecorder.Forms
 
 		#endregion
 
+		#region Connection Health and Recovery
+
+		// Method to manually trigger reconnection
+		private async void ButtonReconnect_Click(object sender, EventArgs e)
+		{
+			if (isConnected)
+			{
+				LogMessage("Manual reconnection requested");
+				await HandleConnectionLoss();
+			}
+		}
+
+		// Method to test connection by sending a ping/heartbeat
+		private async Task<bool> TestConnectionAsync()
+		{
+			try
+			{
+				if (commandStream != null && commandClient?.Connected == true)
+				{
+					// Send a simple heartbeat command
+					var heartbeat = JsonSerializer.Serialize(new
+					{
+						type = "HEARTBEAT",
+						timestamp = DateTime.UtcNow
+					});
+
+					byte[] data = Encoding.UTF8.GetBytes(heartbeat + "\n");
+					await commandStream.WriteAsync(data, 0, data.Length);
+					await commandStream.FlushAsync();
+
+					return true;
+				}
+			}
+			catch (Exception ex)
+			{
+				LogMessage($"Connection test failed: {ex.Message}");
+			}
+
+			return false;
+		}
+
+		// Method to configure reconnection settings
+		public void ConfigureReconnection(bool enabled, int maxAttempts, int delayMs)
+		{
+			autoReconnectEnabled = enabled;
+			maxReconnectAttempts = maxAttempts;
+			reconnectDelayMs = delayMs;
+
+			LogMessage($"Reconnection configured: enabled={enabled}, maxAttempts={maxAttempts}, delay={delayMs}ms");
+		}
+
+		// Method to get connection statistics
+		public ConnectionStats GetConnectionStats()
+		{
+			return new ConnectionStats
+			{
+				IsConnected = isConnected,
+				IsReconnecting = isReconnecting,
+				ReconnectAttempts = reconnectAttempts,
+				LastVideoHeartbeat = lastVideoHeartbeat,
+				LastCommandHeartbeat = lastCommandHeartbeat,
+				FrameCount = frameCount,
+				CommandCount = commandCount,
+				VideoClientConnected = videoClient?.Connected ?? false,
+				CommandClientConnected = commandClient?.Connected ?? false
+			};
+		}
+
+		#endregion
+
 		#region Cleanup
 
 		protected override void Dispose(bool disposing)
@@ -1080,6 +1439,7 @@ namespace VideoStreamRecorder.Forms
 					commandStream?.Dispose();
 					commandClient?.Dispose();
 					cancellationTokenSource?.Dispose();
+					connectionMonitorCts?.Dispose();
 					pictureBoxVideo.Image?.Dispose();
 					components?.Dispose();
 				}
@@ -1109,4 +1469,18 @@ public class CommandEntry
 	public DateTime Timestamp { get; set; }
 	public string Command { get; set; } = string.Empty;
 	public string Source { get; set; } = string.Empty;
+}
+
+// Connection statistics class
+public class ConnectionStats
+{
+	public bool IsConnected { get; set; }
+	public bool IsReconnecting { get; set; }
+	public int ReconnectAttempts { get; set; }
+	public DateTime LastVideoHeartbeat { get; set; }
+	public DateTime LastCommandHeartbeat { get; set; }
+	public int FrameCount { get; set; }
+	public int CommandCount { get; set; }
+	public bool VideoClientConnected { get; set; }
+	public bool CommandClientConnected { get; set; }
 }
