@@ -15,10 +15,11 @@ The Video Streaming Client sets up two communication sockets (video data and com
 Video data is handled by ReceiveVideo and command data is handled by ReceiveCommand. 
 There are currently no commands the client responds to, but the handler is there and will log commands.
 The client may pause the server's playback by hitting 'Pause.' This sends a pause command to the server which suspends transfers from the camera
-The video streaming client responds to unstable network by reporting the issue and attempting reconnects
+The video streaming client responds to unstable network by reporting the issue and attempting reconnection
 
 **Video Streaming Recorder**
 The Video Streaming Recorder sets up communications similarly to the client. 
 When recording is initiated, video data received from the server is saved to an AVI file
 Commands sent from the Streaming Client to the Streaming Server are also received when the Streaming Server echoes the messages out. 
 The Streaming Recorder stores a record of received commands in a json file
+The Streaming Recorder responds to unstable network conditions by reporting and attempting reconnection
